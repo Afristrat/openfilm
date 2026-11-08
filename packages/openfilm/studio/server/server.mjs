@@ -10,7 +10,8 @@
  *   http://localhost:<port + 1>  the film itself: project files, read only, for the preview (see pages.mjs).
  *
  * Both answer only requests addressed to 127.0.0.1, localhost or [::1] at their own port (ownHost): another site
- * whose name is pointed at this machine (DNS rebinding) gets nothing, not even /api/health.
+ * whose name is pointed at this machine (DNS rebinding) gets nothing, not even /api/health. Behind a proxy, each also
+ * answers its own public name when OPENFILM_PUBLIC_ORIGIN and OPENFILM_PUBLIC_FILM_ORIGIN are set (public.mjs).
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { createReadStream, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
@@ -33,6 +34,7 @@ import * as personEdits from './person-edits.mjs';
 import { createAutoVersions } from './auto-versions.mjs';
 import { createHistoryPreviews } from './history-previews.mjs';
 import { ownHost, startPages } from './pages.mjs';
+import { addressedTo, publicOrigins } from './public.mjs';
 import { HttpError, cookie, json, readJson } from './http.mjs';
 import { acceptWebSocket } from './websocket.mjs';
 import {
@@ -158,6 +160,15 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   const toPages = (event) => { for (const send of editorPages.keys()) send(event); };
   let origin = '';
   let filmOrigin = '';
+  /** Studio's public origins, when it is served behind a proxy (public.mjs); null when local only */
+  const published = publicOrigins();
+  /** whether a request came by the editor's public name */
+  const fromPublic = (/** @type {Req} */ req) => addressedTo(req, published?.editorHost);
+  /** the editor's origin as the request's page has it: what a browser write must come from */
+  const pageOrigin = (/** @type {Req} */ req) => (published && fromPublic(req) ? published.editor : origin);
+  /** a folder's address on the film's origin, as the request's page reaches it: the public one for the public editor */
+  const browserFolder = (/** @type {Req} */ req, /** @type {string} */ url) => (published && fromPublic(req) && url.startsWith(filmOrigin)
+    ? published.film + url.slice(filmOrigin.length) : url);
 
   /** where each project's exports report their progress: the pages watching it */
   const exportRoots = new Map();
@@ -172,7 +183,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   function authorize(/** @type {Req} */ req) {
     if (sameKey(/** @type {string | undefined} */ (req.headers['x-studio-key']))) return;
     if (!sameKey(cookieKey(req))) throw new HttpError(401, 'open Studio from the address `openfilm open` prints');
-    if (req.method !== 'GET' && req.method !== 'HEAD' && req.headers.origin !== origin) throw new HttpError(403, 'not from Studio');
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.headers.origin !== pageOrigin(req)) throw new HttpError(403, 'not from Studio');
   }
 
   /*
@@ -379,7 +390,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
       if (sub === 'files') {
         /* `folder`: the library as the film's origin serves it, so a saved page plays in the media pane's viewer as a
            project's does */
-        if (req.method === 'GET') return json(res, 200, { ...await listLibrary(), folder: pages.folderUrl({ id: SAVED_ORIGIN_ID, path: lib }) });
+        if (req.method === 'GET') return json(res, 200, { ...await listLibrary(), folder: browserFolder(req, pages.folderUrl({ id: SAVED_ORIGIN_ID, path: lib })) });
         if (req.method === 'PUT') return json(res, 200, { path: libraryPath((await importFile(lib, rel(at), req)).path) });
         if (req.method === 'PATCH') {
           const { from, to } = /** @type {{ from?: unknown, to?: unknown }} */ (await readJson(req) ?? {});
@@ -725,7 +736,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
         /* `filmMissing`: read as an empty film, and said to be missing (see watch.mjs `film-missing`) */
         /* `outer`: a compound clip's film is in this project, which its editor goes back to (parts.mjs) */
         const outer = await outerProject(project.path);
-        return json(res, 200, { project, folder: pages.folderUrl(project), ...film, ...(projectMissing(project.path) === 'film' ? { filmMissing: true } : {}), ...(outer ? { outer } : {}) });
+        return json(res, 200, { project, folder: browserFolder(req, pages.folderUrl(project)), ...film, ...(projectMissing(project.path) === 'film' ? { filmMissing: true } : {}), ...(outer ? { outer } : {}) });
       }
       if (req.method === 'PATCH') {
         const { name } = /** @type {{ name?: string }} */ (await readJson(req));
@@ -806,7 +817,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
         const snapshot = await historyPreviews.get(project.path, history[1]);
         const film = await readProjectFilm(snapshot.path);
         return json(res, 200, {
-          folder: pages.folderUrl({ id: `${project.id}/history/${history[1]}`, path: snapshot.path }),
+          folder: browserFolder(req, pages.folderUrl({ id: `${project.id}/history/${history[1]}`, path: snapshot.path })),
           doc: film.doc, missing: snapshot.missing,
         });
       }
@@ -1181,7 +1192,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   }
 
   const editor = createServer((req, res) => {
-    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (editor.address()).port)) { json(res, 403, { error: 'not this address' }); return; }
+    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (editor.address()).port, published?.editorHost)) { json(res, 403, { error: 'not this address' }); return; }
     route(req, res).catch((/** @type {unknown} */ e) => {
       const status = e instanceof HttpError || e instanceof ProjectError || e instanceof FileError || e instanceof HistoryError || e instanceof MediaError || e instanceof ExportError
         || e instanceof FetchError || e instanceof BrowseError ? e.status : 500;
@@ -1204,10 +1215,10 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
        would otherwise be an error no one hears, which ends Studio. That connection only is dropped */
     socket.on('error', () => socket.destroy());
     const refuse = (/** @type {string} */ status) => socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
-    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (editor.address()).port)) return refuse('403 Forbidden');
+    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (editor.address()).port, published?.editorHost)) return refuse('403 Forbidden');
     void (async () => {
       const path = new URL(req.url ?? '/', origin).pathname;
-      const keyed = sameKey(/** @type {string | undefined} */ (req.headers['x-studio-key'])) || (sameKey(cookieKey(req)) && req.headers.origin === origin);
+      const keyed = sameKey(/** @type {string | undefined} */ (req.headers['x-studio-key'])) || (sameKey(cookieKey(req)) && req.headers.origin === pageOrigin(req));
       if (!keyed) return refuse('401 Unauthorized');
       const parts = path.split('/').slice(1).map(decodeURIComponent);
       /** @type {() => void} */
@@ -1242,7 +1253,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   FRAMED = framedCookieName(address.port);
   /* the film's port is the next one: when it is not free, the editor's is let go again, so a caller can try others */
   const historyPreviews = createHistoryPreviews();
-  const pages = await startPages({ port: port ? address.port + 1 : 0, editorOrigin: () => origin, secret: key, projects: listProjects }).catch(async (e) => {
+  const pages = await startPages({ port: port ? address.port + 1 : 0, editorOrigin: () => origin, secret: key, projects: listProjects, published }).catch(async (e) => {
     watchers.closeAll();
     await new Promise((done) => editor.close(() => done(undefined)));
     throw e;
