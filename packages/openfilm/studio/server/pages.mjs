@@ -28,6 +28,7 @@ import { HOST_FLAG, folderFiles, listenLocal } from '../../src/host.mjs';
 import { readableLink } from '../../src/media-links.mjs';
 import { clipKind } from '../../src/film-doc.mjs';
 import { readPrefs } from './prefs.mjs';
+import { addressedTo } from './public.mjs';
 import { readyProxy, undecodable } from './proxies.mjs';
 import { madeCopy } from '../../src/seekable.mjs';
 import { isPreviewKey, previewDir } from './preview-cache.mjs';
@@ -83,11 +84,12 @@ const PAGE_SCALE = `(()=>{try{if(parent===window)return;const k=Number(new URL(p
 /**
  * Whether a request was addressed to this machine at `port` by name (its Host): another site whose name is made to
  * point at 127.0.0.1 (DNS rebinding) is the same origin as nothing here, but its requests say its own name, and are
- * refused. Studio's two origins both ask it.
- * @param {import('node:http').IncomingMessage} req @param {number} port
+ * refused. Studio's two origins both ask it. `publicHost`: the server's public name (public.mjs), answered too.
+ * @param {import('node:http').IncomingMessage} req @param {number} port @param {string} [publicHost]
  */
-export function ownHost(req, port) {
+export function ownHost(req, port, publicHost) {
   const host = String(req.headers.host ?? '').toLowerCase();
+  if (publicHost && host === publicHost) return true;
   const names = ['127.0.0.1', 'localhost', '[::1]'];
   /* a browser leaves the port out when it is the scheme's own */
   return names.some((name) => host === `${name}:${port}` || (port === 80 && host === name));
@@ -115,24 +117,28 @@ function servable(root, plain) {
 /**
  * `secret`: what tokens are signed with (Studio's key). `projects`: the projects there are, for a token not seen since
  * this launch (a page open from before Studio restarted).
- * @param {{ port: number, editorOrigin: () => string, secret: string, projects: () => Promise<{ id: string, path: string }[]> }} options
+ * `published`: Studio's public origins (public.mjs): a request to the film's public name is answered for the public
+ * editor, every other one for the local editor.
+ * @param {{ port: number, editorOrigin: () => string, secret: string, projects: () => Promise<{ id: string, path: string }[]>, published?: ReturnType<typeof import('./public.mjs').publicOrigins> }} options
  */
-export async function startPages({ port, editorOrigin, secret, projects }) {
+export async function startPages({ port, editorOrigin, secret, projects, published = null }) {
+  /** the editor a request is answered for: the public one when it came by the film's public name */
+  const editorFor = (/** @type {boolean} */ pub) => (pub && published ? published.editor : editorOrigin());
   /* read by the editor (its mixer fetches the media). Framed by it with no frame-ancestors rule: that rule is checked
      against every frame up to the window, so Studio shown inside another app's frame (an agent's preview pane) would
      lose its picture; a page is reached only through its project's token, which only the editor has */
-  const policy = () => ({
-    'access-control-allow-origin': editorOrigin(),
+  const policy = (pub = false) => ({
+    'access-control-allow-origin': editorFor(pub),
     'x-content-type-options': 'nosniff',
   });
   /* Studio's scripts, told the editor's origin (the only one they answer) */
-  const scripts = (/** @type {string[]} */ ...list) => list.map((js) => `<script>${js.replaceAll('__EDITOR__', JSON.stringify(editorOrigin()))}</script>`).join('');
+  const scripts = (/** @type {boolean} */ pub, /** @type {string[]} */ ...list) => list.map((js) => `<script>${js.replaceAll('__EDITOR__', JSON.stringify(editorFor(pub)))}</script>`).join('');
   /* the timeline page (the preview) gets the bridge and the stage; a web page gets the bridge too, so the editor can
      play one on its own (the media pane's viewer) — inside the timeline it stays quiet: its parent is not the editor */
-  const filesOf = (/** @type {string} */ root) => folderFiles(root, {
-    inject: `<script>${HOST_FLAG}${PAGE_SCALE}</script>${scripts(BRIDGE)}`,
-    timelineInject: `<script>${HOST_FLAG}</script>${scripts(BRIDGE, STAGE)}`,
-    headers: policy(),
+  const filesOf = (/** @type {string} */ root, pub = false) => folderFiles(root, {
+    inject: `<script>${HOST_FLAG}${PAGE_SCALE}</script>${scripts(pub, BRIDGE)}`,
+    timelineInject: `<script>${HOST_FLAG}</script>${scripts(pub, BRIDGE, STAGE)}`,
+    headers: policy(pub),
     /* heavy footage is played from its proxy once it is made, while proxies are on, and footage the editor's browser
        does not decode whether they are or not (proxies.mjs); else from a copy made for footage a render's browser does
        not decode, or that seeks slowly (src/seekable.mjs), when there is one */
@@ -145,9 +151,9 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
   });
 
   /** a project's playable copies (UNPLAYABLE), served as its files are */
-  const copiesOf = (/** @type {string} */ root) => folderFiles(join(root, PLAYABLE_DIR), { headers: policy() });
+  const copiesOf = (/** @type {string} */ root, pub = false) => folderFiles(join(root, PLAYABLE_DIR), { headers: policy(pub) });
 
-  /** @type {Map<string, { root: string, files: ReturnType<typeof folderFiles> }>} */
+  /** @type {Map<string, { root: string, files: ReturnType<typeof folderFiles>, publicFiles?: ReturnType<typeof folderFiles> }>} */
   const byToken = new Map();
   const tokenOf = (/** @type {string} */ id) => createHmac('sha256', secret).update(`film origin\0${id}`).digest().subarray(0, 18).toString('base64url');
   /**
@@ -175,8 +181,9 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
   };
 
   const server = createServer(async (req, res) => {
-    const headers = policy();
-    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (server.address()).port)) { res.writeHead(403, headers).end('not this address'); return; }
+    const pub = addressedTo(req, published?.filmHost);
+    const headers = policy(pub);
+    if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (server.address()).port, published?.filmHost)) { res.writeHead(403, headers).end('not this address'); return; }
     const url = new URL(req.url ?? '/', 'http://pages');
     if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405, headers).end(); return; }
     const match = /^\/p\/([\w-]+)(\/.*)?$/.exec(url.pathname);
@@ -193,23 +200,25 @@ export async function startPages({ port, editorOrigin, secret, projects }) {
       const file = await soundOf(entry.root, plain.replace(/^\/+/, '')).catch((/** @type {any} */ e) => (e?.status === 404 ? undefined : null));
       if (file === undefined) { res.writeHead(404, headers).end('not found'); return; }
       if (!file) { res.writeHead(204, headers).end(); return; }
-      if (!folderFiles(dirname(file), { headers: policy() })(req, res, `/${basename(file)}`, url.searchParams)) res.writeHead(403, headers).end();
+      if (!folderFiles(dirname(file), { headers: policy(pub) })(req, res, `/${basename(file)}`, url.searchParams)) res.writeHead(403, headers).end();
       return;
     }
     /* a stretch of the film rendered for the preview to play in its place (preview-cache.mjs): its cache, not the
        project's files */
     const render = /^\/__film\/preview\/([0-9a-f]+)\.mp4$/.exec(plain);
     if (render && isPreviewKey(render[1])) {
-      if (!folderFiles(previewDir(entry.root), { headers: policy() })(req, res, `/${render[1]}.mp4`, url.searchParams)) res.writeHead(403, headers).end();
+      if (!folderFiles(previewDir(entry.root), { headers: policy(pub) })(req, res, `/${render[1]}.mp4`, url.searchParams)) res.writeHead(403, headers).end();
       return;
     }
     if (UNPLAYABLE.test(plain)) {
       const copy = await playableCopy(entry.root, plain.replace(/^\/+/, ''));
       if (!copy) { res.writeHead(404, headers).end('not found'); return; }
-      if (!copiesOf(entry.root)(req, res, `/${copy}`, url.searchParams)) res.writeHead(403, headers).end();
+      if (!copiesOf(entry.root, pub)(req, res, `/${copy}`, url.searchParams)) res.writeHead(403, headers).end();
       return;
     }
-    if (!entry.files(req, res, path, url.searchParams)) res.writeHead(403, headers).end();
+    /* the public editor's variant, made when first asked for (its scripts and headers name that editor) */
+    const files = pub ? (entry.publicFiles ??= filesOf(entry.root, true)) : entry.files;
+    if (!files(req, res, path, url.searchParams)) res.writeHead(403, headers).end();
   });
   await listenLocal(server, port);
   /* named `localhost`, not 127.0.0.1 as the editor is: another site to the browser, not only another origin, so it puts
