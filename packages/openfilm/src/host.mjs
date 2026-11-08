@@ -334,7 +334,7 @@ export async function launch({ headed = false, channel = headed ? 'chromium' : n
   };
   const browser = extra.some((a) => a.startsWith('--use-angle')) ? await open([])
     : process.platform === 'darwin' ? await open(['--use-angle=metal'])
-    : process.platform === 'win32' ? await onWindows(open)
+    : process.platform === 'win32' || process.platform === 'linux' ? await vulkanTried(open)
     : await open([]);
   LIVE.add(browser);
   browser.on('disconnected', () => LIVE.delete(browser));
@@ -417,7 +417,8 @@ const deviceOf = (/** @type {string} */ renderer) => {
 };
 
 /**
- * Windows: headless Chromium picks no ANGLE backend by itself and draws WebGL with SwiftShader, on the CPU. Vulkan
+ * Windows and Linux: headless Chromium picks no ANGLE backend by itself and draws WebGL with SwiftShader, on the CPU
+ * (on Linux too, a server with an NVIDIA card included, measured: SwiftShader by default, the card with Vulkan). Vulkan
  * reaches the GPU (on a laptop with two, the discrete one: d3d11 and gl take the integrated one). A virtual machine, a
  * CI runner or a computer without a Vulkan driver has none, so the first browser reads its renderer once: when Vulkan
  * did not start, or is software too, it and every later browser take Chromium's default.
@@ -496,10 +497,11 @@ export function vulkanFirst(renderer = rendererOf, presents = presentsVideo) {
   };
   return pick;
 }
-const onWindows = vulkanFirst();
+/* Direct3D, asked for on Linux, fails to open and is passed over: there Vulkan on the GPU, else the default */
+const vulkanTried = vulkanFirst();
 
-/** A film's video frames were never seen (FilmPage.seek): on Windows, browsers opened from now on show video another way. */
-export const videoNotShown = () => (process.platform === 'win32' ? onWindows.videoNotShown() : Promise.resolve(false));
+/** A film's video frames were never seen (FilmPage.seek): on Windows and Linux, browsers opened from now on show video another way. */
+export const videoNotShown = () => (process.platform === 'win32' || process.platform === 'linux' ? vulkanTried.videoNotShown() : Promise.resolve(false));
 
 /** Every browser launch() opened and that is still open. */
 const LIVE = new Set();
