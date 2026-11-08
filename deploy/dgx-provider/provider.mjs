@@ -23,6 +23,8 @@ const MODELS = {
   asr: [{ id: 'qwen3-asr', name: 'Qwen3-ASR 1.7B' }],
   image: [{ id: 'flux1-schnell', name: 'Flux.1 Schnell', spec: { ratios: ['16:9', '9:16', '1:1', '4:3', '3:4'] } }],
   music: [{ id: 'ace-step-1.5-turbo', name: 'ACE-Step 1.5 Turbo' }],
+  /* Stable Audio Open 1.0 (ComfyUI natif : ConditioningStableAudio, encodeur t5_base), jusqu'à 47 s */
+  sfx: [{ id: 'stable-audio-open-1.0', name: 'Stable Audio Open 1.0' }],
   /* Wan 2.2 TI2V 5B : 24 images/s, 1 à 5 s (2 s en environ 2 min 30 sur le GB10, mesuré le 2026-11-08) ; image de départ
      possible (--first-frame), pas d'image de fin */
   video: [{ id: 'wan2.2-ti2v-5b', name: 'Wan 2.2 TI2V 5B', spec: { ratios: ['16:9', '9:16', '1:1'], seconds: /** @type {[number, number]} */ ([1, 5]), frames: true } }],
@@ -80,7 +82,7 @@ export default {
   env: 'OPENFILM_DGX',
   keysUrl: 'https://film.ai-mpower.com',
   billingUrl: 'https://film.ai-mpower.com',
-  verbs: ['voice', 'tts', 'asr', 'image', 'music', 'video'],
+  verbs: ['voice', 'tts', 'asr', 'image', 'music', 'sfx', 'video'],
   models: MODELS,
   /* aucune clé : les services sont sur la machine même ; connecté tant que Studio tourne sur le DGX */
   ready: () => true,
@@ -168,6 +170,34 @@ export default {
       return {
         files: [{ path, bytes: made.bytes }],
         index: [{ src: path, kind: 'audio', dur: sec, from: { mode: 'music', prompt, provider: 'dgx', model } }],
+        receipt: { provider: 'dgx', model, src: path, dur: sec },
+        cost: { note: 'gratuit, sur le DGX' },
+      };
+    }
+    if (verb === 'sfx') {
+      const prompt = needed(args, 'prompt');
+      const model = modelOf(MODELS, 'sfx', ctx);
+      const sec = clamp(number(args.sec) ?? 5, 1, 47);
+      const ckpts = /** @type {any} */ (await (await ask(`${COMFY}/object_info/CheckpointLoaderSimple`, {}, ctx.signal)).json())?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] ?? [];
+      if (!ckpts.includes('stable-audio-open-1.0.safetensors')) {
+        throw new Error(`${NAME} : le modèle d'effets sonores n'est pas encore sur le DGX (accès à accepter sur https://huggingface.co/stabilityai/stable-audio-open-1.0, puis ~/openfilm-docker/telecharger-stable-audio.sh).`);
+      }
+      const graph = {
+        1: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'stable-audio-open-1.0.safetensors' } },
+        2: { class_type: 'CLIPLoader', inputs: { clip_name: 't5_base.safetensors', type: 'stable_audio' } },
+        3: { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
+        4: { class_type: 'CLIPTextEncode', inputs: { text: '', clip: ['2', 0] } },
+        5: { class_type: 'ConditioningStableAudio', inputs: { positive: ['3', 0], negative: ['4', 0], seconds_start: 0, seconds_total: sec } },
+        6: { class_type: 'EmptyLatentAudio', inputs: { seconds: sec, batch_size: 1 } },
+        7: { class_type: 'KSampler', inputs: { model: ['1', 0], seed: seed(), steps: 50, cfg: 4.98, sampler_name: 'dpmpp_3m_sde_gpu', scheduler: 'exponential', positive: ['5', 0], negative: ['5', 1], latent_image: ['6', 0], denoise: 1.0 } },
+        8: { class_type: 'VAEDecodeAudio', inputs: { samples: ['7', 0], vae: ['1', 2] } },
+        9: { class_type: 'SaveAudio', inputs: { audio: ['8', 0], filename_prefix: 'openfilm-sfx' } },
+      };
+      const made = await comfy(graph, 'audio', ctx);
+      const path = landing('audio/sfx', args.out, 'flac');
+      return {
+        files: [{ path, bytes: made.bytes }],
+        index: [{ src: path, kind: 'audio', dur: sec, from: { mode: 'sfx', prompt, provider: 'dgx', model } }],
         receipt: { provider: 'dgx', model, src: path, dur: sec },
         cost: { note: 'gratuit, sur le DGX' },
       };
