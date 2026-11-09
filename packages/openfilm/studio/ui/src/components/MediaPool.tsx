@@ -28,6 +28,7 @@ import {
   ExternalLink,
   FolderInput,
   FolderSymlink,
+  Globe,
   HardDriveDownload,
   ImagePlus,
   Link2,
@@ -642,11 +643,12 @@ export function MediaPool({
     { id: 'import', label: t('media.importFiles'), note: t('media.importFilesNote'), icon: <Upload size={14} />, onSelect: () => { void bringFrom('copy', false); } },
     { id: 'link', label: t('media.linkFiles'), note: t('media.linkFilesNote'), icon: <Link2 size={14} />, onSelect: () => { void bringFrom('link', false); } },
     { id: 'link-folder', label: t('media.linkFolder'), icon: <FolderSymlink size={14} />, onSelect: () => { void bringFrom('link', true); } },
+    ...(onFromUrl ? [{ id: 'from-url', label: t('media.importLink'), note: t('media.importLinkNote'), icon: <Globe size={14} />, onSelect: () => setLinking(true) }] : []),
   ];
   /* in a browser: files picked there, or a link downloaded on the server */
   const browserImportMenu: ContextMenuEntry[] = [
     { id: 'import', label: t('media.importFiles'), note: t('media.importFilesNote'), icon: <Upload size={14} />, onSelect: () => inputRef.current?.click() },
-    { id: 'from-url', label: t('media.importLink'), note: t('media.importLinkNote'), icon: <Link2 size={14} />, onSelect: () => setLinking(true) },
+    { id: 'from-url', label: t('media.importLink'), note: t('media.importLinkNote'), icon: <Globe size={14} />, onSelect: () => setLinking(true) },
   ];
   const blankMenu: ContextMenuEntry[] = [
     { id: 'new-folder', label: t('assets.newFolder'), icon: <FolderPlus size={14} />, onSelect: () => setCreating(true) },
