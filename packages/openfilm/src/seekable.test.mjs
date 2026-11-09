@@ -12,6 +12,16 @@ import { look } from './look.mjs';
 
 const hasFfmpeg = (() => { try { execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
 const ffmpeg = { skip: !hasFfmpeg && 'no ffmpeg', timeout: 120_000 };
+/** A render's copies on this machine: VP9 (.webm) where its browser plays no H.264 (Playwright's Chromium on Linux
+    ARM), else H.264 (.mp4). Asked of the browser itself, as browserCopies asks it. */
+const COPY = await (async () => {
+  let browser;
+  try {
+    browser = await launch();
+    const page = await browser.newPage();
+    return (await page.evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"'))) ? '.mp4' : '.webm';
+  } catch { return '.mp4'; } finally { await browser?.close(); }
+})();
 
 /** 4 s at 30 fps with a key frame every `gop` frames. */
 const clip = (file, gop) => execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30', '-t', '4',
@@ -96,7 +106,7 @@ test('a render serves the film\'s slow-seeking videos as their copies', ffmpeg, 
     writeFileSync(join(dir, 'film.html'), filmHtml({ stage: { w: 320, h: 180 }, tracks: [{ clips: [{ id: 'v', src: 'a.mp4', at: 0, time: [0, 3] }] }] }));
     const done = await render([dir], { out: join(dir, 'out.mp4'), workers: 2, silent: true, onProgress() {} });
     assert.ok(existsSync(done.out));
-    assert.equal(readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith('.mp4') && !f.includes('.part')).length, 1);
+    assert.equal(readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith(COPY) && !f.includes('.part')).length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -114,13 +124,16 @@ test('footage the browser plays the sound of but shows no picture of, ProRes wit
     const page = await browser.newPage();
     const plays = (file) => page.evaluate(firstFrame, `${site.url}/${relative(dir, file).split(sep).map(encodeURIComponent).join('/')}`);
     assert.equal(await plays(join(dir, 'prores-sound.mov')), false, 'a file it shows no picture of is not playable');
-    assert.equal(await plays(join(dir, 'fast.mp4')), true, 'a video with a picture plays');
-    /* asked as a render asks it: only the footage without a picture needs a copy */
-    const copies = await seekableCopies([join(dir, 'prores-sound.mov'), join(dir, 'fast.mp4')], dir, { plays, slow: false });
-    assert.deepEqual([...copies.keys()], [join(dir, 'prores-sound.mov')]);
+    assert.equal(await plays(join(dir, 'fast.mp4')), COPY === '.mp4', 'a video with a picture plays, H.264 where the browser has it');
+    /* asked as a render asks it: only the footage without a picture needs a copy (and H.264 where the browser has none) */
+    const webm = COPY === '.webm';
+    const copies = await seekableCopies([join(dir, 'prores-sound.mov'), join(dir, 'fast.mp4')], dir, { plays, slow: false, webm });
+    assert.deepEqual([...copies.keys()].sort(), (webm ? [join(dir, 'fast.mp4'), join(dir, 'prores-sound.mov')] : [join(dir, 'prores-sound.mov')]).sort());
     const copy = /** @type {string} */ (copies.get(join(dir, 'prores-sound.mov')));
     assert.equal(await plays(copy), true, 'the copy plays');
-    assert.deepEqual(times(copy), times(join(dir, 'prores-sound.mov')), 'the same frames at the same times');
+    /* WebM keeps times to the millisecond */
+    const kept = times(copy), source = times(join(dir, 'prores-sound.mov'));
+    assert.ok(kept.length === source.length && kept.every((t, i) => Math.abs(t - source[i]) <= 0.001), 'the same frames at the same times');
     assert.equal(soundStreams(copy), '', 'the copy is the picture only: the sound is still mixed from the original');
   } finally {
     await browser.close();
@@ -190,7 +203,7 @@ test('a render shows ProRes footage, which no browser decodes, through its copy'
     const started = Date.now();
     const done = await render([dir, '0-0.5'], { out: join(dir, 'out.mp4'), workers: 1, silent: true, onProgress() {} });
     assert.ok(Date.now() - started < 60_000, 'no frame waits on a video that never shows');
-    const [made] = readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith('.mp4') && !f.includes('.part'));
+    const [made] = readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith(COPY) && !f.includes('.part'));
     assert.ok(made, 'the footage is drawn through its copy');
     assert.equal(soundStreams(join(dir, '.film/cache/seek', made)), '', 'the copy is the picture only');
     const [r, g, b] = execFileSync('ffmpeg', ['-v', 'error', '-ss', '0.2', '-i', done.out, '-frames:v', '1', '-vf', 'crop=4:4:160:90,format=rgb24', '-f', 'rawvideo', '-']);
@@ -207,7 +220,7 @@ test('footage too big for H.264 that the browser does not decode gets a copy sca
     assert.deepEqual(await copyNeed(join(dir, 'a.mov'), { plays: async () => false }), { why: 'unplayable', fps: 10, w: 4096, h: 2234, alpha: false, scaled: true });
     writeFileSync(join(dir, 'film.html'), filmHtml({ stage: { w: 320, h: 180 }, tracks: [{ clips: [{ id: 'v', src: 'a.mov', at: 0, time: [0, 1] }] }] }));
     const done = await render([dir, '0-0.5'], { out: join(dir, 'out.mp4'), workers: 1, silent: true, onProgress() {} });
-    const copy = readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith('.mp4'));
+    const copy = readdirSync(join(dir, '.film/cache/seek')).filter((f) => f.endsWith(COPY));
     assert.equal(copy.length, 1);
     const size = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'csv=p=0', join(dir, '.film/cache/seek', copy[0])]).toString().trim();
     assert.equal(size, '4096,2234');
