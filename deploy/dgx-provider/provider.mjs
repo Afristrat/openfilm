@@ -23,8 +23,9 @@ const MODELS = {
   asr: [{ id: 'qwen3-asr', name: 'Qwen3-ASR 1.7B' }],
   image: [{ id: 'flux1-schnell', name: 'Flux.1 Schnell', spec: { ratios: ['16:9', '9:16', '1:1', '4:3', '3:4'] } }],
   music: [{ id: 'ace-step-1.5-turbo', name: 'ACE-Step 1.5 Turbo' }],
-  /* Stable Audio Open 1.0 (ComfyUI natif : ConditioningStableAudio, encodeur t5_base), jusqu'à 47 s */
-  sfx: [{ id: 'stable-audio-open-1.0', name: 'Stable Audio Open 1.0' }],
+  /* Stable Audio 3 Small SFX (copie Comfy-Org, encodeur t5gemma, 8 pas lcm, CFG 1) : 0,5 s par son jusqu'à 47 s et 5 sons
+     sur 7 reconnus par AudioSet contre 2 pour Stable Audio Open 1.0 (ConditioningStableAudio, t5_base), mesuré le 2026-11-09 */
+  sfx: [{ id: 'stable-audio-3-small-sfx', name: 'Stable Audio 3 SFX' }, { id: 'stable-audio-open-1.0', name: 'Stable Audio Open 1.0' }],
   /* LTX 2.3 22B fp8, branche distillée (LoRA 384, 8 pas) : image ET son, 24 images/s ; à chaud sur le GB10, 2 s en 50 s et
      5 s en 114 s en 1280×704 (mesuré le 2026-11-09). Wan 2.2 TI2V 5B, sans son : 2 s en environ 2 min 30 (2026-11-08).
      Image de départ possible (--first-frame) pour les deux, pas d'image de fin. */
@@ -184,10 +185,22 @@ export default {
       const model = modelOf(MODELS, 'sfx', ctx);
       const sec = clamp(number(args.sec) ?? 5, 1, 47);
       const ckpts = /** @type {any} */ (await (await ask(`${COMFY}/object_info/CheckpointLoaderSimple`, {}, ctx.signal)).json())?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] ?? [];
-      if (!ckpts.includes('stable-audio-open-1.0.safetensors')) {
-        throw new Error(`${NAME} : le modèle d'effets sonores n'est pas encore sur le DGX (lancer ~/openfilm-docker/telecharger-stable-audio.sh sur spark-1540).`);
+      const sa3 = model === 'stable-audio-3-small-sfx';
+      const file = sa3 ? 'stable_audio_3_small_sfx.safetensors' : 'stable-audio-open-1.0.safetensors';
+      if (!ckpts.includes(file)) {
+        throw new Error(`${NAME} : le modèle d'effets sonores ${file} n'est pas sur le DGX (lancer ~/openfilm-docker/telecharger-stable-audio.sh sur spark-1540).`);
       }
-      const graph = {
+      /* graphe du modèle officiel « audio_stable_audio_3 » de Comfy-Org, sans la réécriture du texte par un LLM */
+      const graph = sa3 ? {
+        1: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: file } },
+        2: { class_type: 'CLIPLoader', inputs: { clip_name: 't5gemma_b_b_ul2.safetensors', type: 'stable_audio', device: 'default' } },
+        3: { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
+        4: { class_type: 'CLIPTextEncode', inputs: { text: '', clip: ['2', 0] } },
+        5: { class_type: 'EmptyLatentAudio', inputs: { seconds: sec, batch_size: 1 } },
+        6: { class_type: 'KSampler', inputs: { model: ['1', 0], seed: seed(), steps: 8, cfg: 1, sampler_name: 'lcm', scheduler: 'simple', positive: ['3', 0], negative: ['4', 0], latent_image: ['5', 0], denoise: 1.0 } },
+        7: { class_type: 'VAEDecodeAudio', inputs: { samples: ['6', 0], vae: ['1', 2] } },
+        8: { class_type: 'SaveAudio', inputs: { audio: ['7', 0], filename_prefix: 'openfilm-sfx' } },
+      } : {
         1: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'stable-audio-open-1.0.safetensors' } },
         2: { class_type: 'CLIPLoader', inputs: { clip_name: 't5_base.safetensors', type: 'stable_audio' } },
         3: { class_type: 'CLIPTextEncode', inputs: { text: prompt, clip: ['2', 0] } },
