@@ -157,6 +157,29 @@ test('footage the browser does not decode gets a copy it plays, with its alpha w
   }
 });
 
+test('a browser without H.264 (Playwright\'s Chromium on Linux ARM) is asked about H.264 footage and gets VP9 copies', ffmpeg, async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'of-seekable-webm-'));
+  try {
+    clip(join(dir, 'fast.mp4'), 5);
+    const asked = [];
+    const plays = async (file) => { asked.push(file.split(/[\\/]/).pop()); return false; };
+    assert.deepEqual(await copyNeed(join(dir, 'fast.mp4'), { plays, webm: true }), { why: 'unplayable', fps: 30, w: 320, h: 180, alpha: false });
+    assert.deepEqual(asked, ['fast.mp4'], 'H.264 asked of the browser');
+    assert.equal(await copyNeed(join(dir, 'fast.mp4'), { plays: async () => true, webm: true }), null, 'one it plays after all needs no copy');
+    const copy = /** @type {string} */ ((await seekableCopies([join(dir, 'fast.mp4')], dir, { plays, slow: false, webm: true })).get(join(dir, 'fast.mp4')));
+    assert.ok(copy.endsWith('.webm'), copy);
+    assert.equal(execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=codec_name,pix_fmt', '-of', 'csv=p=0', copy]).toString().trim(), 'vp9,yuv420p');
+    /* WebM keeps times to the millisecond */
+    const kept = times(copy), source = times(join(dir, 'fast.mp4'));
+    assert.ok(kept.length === source.length && kept.every((t, i) => Math.abs(t - source[i]) <= 0.001), 'the same frames at the same times');
+    const fine = /** @type {string} */ ((await seekableCopies([join(dir, 'fast.mp4')], dir, { plays, slow: false, webm: true, fine: true })).get(join(dir, 'fast.mp4')));
+    assert.ok(fine.endsWith('-fine.webm') && fine !== copy, fine);
+    assert.equal(madeCopy(join(dir, 'fast.mp4'), dir), copy, 'the preview finds the VP9 copy');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a render shows ProRes footage, which no browser decodes, through its copy', ffmpeg, async () => {
   const dir = mkdtempSync(join(tmpdir(), 'of-seekable-prores-render-'));
   try {

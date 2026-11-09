@@ -1,6 +1,9 @@
 # OpenFilm Studio (fork Afristrat/openfilm, branche dgx-0.3.1) sur DGX spark-1540, arm64.
+# Vulkan sur la carte (navigateur de rendu) : libegl1 (glvnd) ici ET, au lancement, les fichiers de l'hôte montés en
+# lecture seule : vulkan/icd.d/nvidia_icd.json, vulkan/implicit_layer.d/nvidia_layers.json, glvnd/egl_vendor.d/10_nvidia.json
+# (sans l'un des deux, vkCreateInstance échoue : « Found no drivers », mesuré le 2026-11-09). Commande : run-studio.sh.
 FROM node:22-bookworm
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git libvulkan1 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg git libvulkan1 libegl1 && rm -rf /var/lib/apt/lists/*
 RUN npm i -g pnpm@10.30.3 && pnpm config set manage-package-manager-versions false --location=global
 WORKDIR /opt/openfilm
 ARG REF=dgx-0.3.1

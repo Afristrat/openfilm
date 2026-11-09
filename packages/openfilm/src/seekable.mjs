@@ -21,8 +21,9 @@ const MAX_SECONDS = 10 * 60;
 /** Bigger than this is not copied at its size (H.264 stops at 4096 on a side in most decoders): left as it is when it
     plays, else copied scaled down to fit. */
 const MAX_SIDE = 4096;
-/** Changing how copies are made makes new ones (3: a VP9's or an HEVC's alpha was not seen, and its copy was without it). */
-const VERSION = 3;
+/** Changing how copies are made makes new ones (3: a VP9's or an HEVC's alpha was not seen, and its copy was without it;
+    4: a browser without H.264 was given H.264 copies it could not play). */
+const VERSION = 4;
 /** A copy on the graphics chip that writes nothing for this long has hung (VideoToolbox does on some virtual Macs):
     stopped, and made on the processor. */
 const STALL_MS = 15_000;
@@ -83,7 +84,8 @@ export async function slowSeeking(file) {
   return span / keys > SLOW_GOP_S ? { fps, seconds, w: Number(stream.width), h: Number(stream.height) } : null;
 }
 
-/** Every Chromium decodes these by itself, with its own decoders, on any machine: no need to ask it. */
+/** Every Chromium decodes these by itself, with its own decoders, on any machine: no need to ask it. Except H.264 in a
+    Chromium built without it (Playwright's on Linux ARM: VP8, VP9 and AV1 only), which `webm` says (copyNeed). */
 export const decodedAnywhere = (/** @type {{ codec_name?: string, pix_fmt?: string }} */ s) =>
   (s.codec_name === 'h264' && ['yuv420p', 'yuvj420p'].includes(String(s.pix_fmt))) || ['vp8', 'vp9', 'av1'].includes(String(s.codec_name));
 
@@ -91,11 +93,12 @@ export const decodedAnywhere = (/** @type {{ codec_name?: string, pix_fmt?: stri
  * What a render needs of a video: a copy because its browser does not decode it here (`unplayable`: ProRes in any
  * browser, HEVC without a chip for it, 10-bit H.264…, asked of the browser itself with `plays`; `alpha` when its
  * picture has one to keep), or because it seeks slowly (`slow`, slowSeeking, only when `slow` is asked for); null for
- * neither. `w` and `h` are the copy's size: `scaled` when that is smaller than the video's.
- * @param {string} file @param {{ plays?: (file: string) => Promise<boolean>, slow?: boolean }} [options]
+ * neither. `w` and `h` are the copy's size: `scaled` when that is smaller than the video's. `webm`: the browser plays
+ * no H.264 at all, so an H.264 video is asked of it like any other.
+ * @param {string} file @param {{ plays?: (file: string) => Promise<boolean>, slow?: boolean, webm?: boolean }} [options]
  * @returns {Promise<{ why: 'unplayable' | 'slow', fps: number, w: number, h: number, alpha: boolean, scaled?: true } | null>}
  */
-export async function copyNeed(file, { plays, slow = true } = {}) {
+export async function copyNeed(file, { plays, slow = true, webm = false } = {}) {
   let info;
   try {
     info = JSON.parse(await probe(file, ['-select_streams', 'v:0', '-show_entries', `stream=codec_name,width,height,avg_frame_rate,${ALPHA_ENTRIES}`, '-of', 'json']));
@@ -103,7 +106,8 @@ export async function copyNeed(file, { plays, slow = true } = {}) {
   const stream = info.streams?.[0];
   if (!stream) return null;
   const w = Number(stream.width), h = Number(stream.height);
-  if (plays && !decodedAnywhere(stream) && !(await plays(file))) {
+  const free = decodedAnywhere(stream) && !(webm && stream.codec_name === 'h264');
+  if (plays && !free && !(await plays(file))) {
     const [n, d] = String(stream.avg_frame_rate).split('/').map(Number);
     const alpha = hasAlpha(stream);
     const need = { why: /** @type {const} */ ('unplayable'), fps: n > 0 && d > 0 ? n / d : 30, w, h, alpha };
@@ -198,7 +202,10 @@ export async function browserCopies(browser, origin, root, files, { signal, slow
     return (await tester).evaluate(firstFrame, url).catch(() => false);
   };
   try {
-    return await seekableCopies(files, root, { signal, plays, slow, fine, failed });
+    tester ??= browser.newPage();
+    /* a Chromium without H.264 (Playwright's on Linux ARM): its copies are VP9, which it plays */
+    const webm = !(await (await tester).evaluate(() => document.createElement('video').canPlayType('video/mp4; codecs="avc1.42E01E"')).catch(() => 'yes'));
+    return await seekableCopies(files, root, { signal, plays, slow, fine, failed, webm });
   } catch {
     return new Map();
   } finally {
@@ -211,11 +218,12 @@ export async function browserCopies(browser, origin, root, files, { signal, slow
  * from a file to its copy. A file that is fine as it is, or whose copy fails, is not in it; one whose copy fails is
  * told to `failed`. `plays`: whether the render's browser decodes a file; `slow`: whether slow-seeking ones get a copy
  * too (a render of more than a moment). `fine`: copies for a master export, kept apart from the preview's: as near the
- * file as a browser plays, so a dark gradient keeps its grain instead of breaking into bands.
+ * file as a browser plays, so a dark gradient keeps its grain instead of breaking into bands. `webm`: the browser plays
+ * no H.264, so every copy is VP9 (and an H.264 video gets one).
  * @param {string[]} files @param {string} root
- * @param {{ signal?: AbortSignal, plays?: (file: string) => Promise<boolean>, slow?: boolean, fine?: boolean, failed?: (file: string) => void }} [options]
+ * @param {{ signal?: AbortSignal, plays?: (file: string) => Promise<boolean>, slow?: boolean, fine?: boolean, failed?: (file: string) => void, webm?: boolean }} [options]
  */
-export async function seekableCopies(files, root, { signal, plays, slow = true, fine = false, failed } = {}) {
+export async function seekableCopies(files, root, { signal, plays, slow = true, fine = false, failed, webm = false } = {}) {
   const copies = new Map();
   outDir(root, 'seek');
   /* two at a time: on the processor each one keeps several cores busy; on the graphics chip it leaves them free */
@@ -227,19 +235,22 @@ export async function seekableCopies(files, root, { signal, plays, slow = true, 
       try { stat = statSync(file); } catch { continue; }
       const base = copyBase(file, root, stat);
       /* madeCopy finds it from now on, without waiting out a miss it remembers */
-      const known = (/** @type {string} */ copy) => { copies.set(file, copy); if (!copy.endsWith(FINE)) found.set(`${root}\0${file}\0${stat.size}\0${stat.mtimeMs}`, { copy, at: Date.now() }); };
-      const made = [fine ? `${base}${FINE}` : `${base}.mp4`, `${base}.webm`].find((f) => existsSync(f));
+      const known = (/** @type {string} */ copy) => { copies.set(file, copy); if (!copy.endsWith(FINE) && !copy.endsWith(FINE_WEBM)) found.set(`${root}\0${file}\0${stat.size}\0${stat.mtimeMs}`, { copy, at: Date.now() }); };
+      /* a browser without H.264 is never served an .mp4 copy */
+      const made = (webm ? [fine ? `${base}${FINE_WEBM}` : `${base}.webm`] : [fine ? `${base}${FINE}` : `${base}.mp4`, `${base}.webm`]).find((f) => existsSync(f));
       if (made) { known(made); continue; }
-      const need = await copyNeed(file, { plays, slow });
+      const need = await copyNeed(file, { plays, slow, webm });
       if (!need) continue;
-      /* with an alpha to keep: VP9, which every Chromium decodes with its alpha; else H.264 */
-      const out = need.alpha ? `${base}.webm` : fine ? `${base}${FINE}` : `${base}.mp4`;
+      /* with an alpha to keep, or for a browser without H.264: VP9, which every Chromium decodes (with its alpha);
+         else H.264 */
+      const vp9 = need.alpha || webm;
+      const out = vp9 ? (fine && !need.alpha ? `${base}${FINE_WEBM}` : `${base}.webm`) : fine ? `${base}${FINE}` : `${base}.mp4`;
       /* one copy of a file at a time in this process (pages drawn at once may share a source): a render asking for one
          being made waits for it, and makes it itself when the render making it was cancelled */
       const shared = () => {
         let job = making.get(out);
         if (!job) {
-          job = makeCopy(file, out, need, signal, fine && !need.alpha).finally(() => making.delete(out));
+          job = makeCopy(file, out, { ...need, vp9 }, signal, fine && !need.alpha).finally(() => making.delete(out));
           making.set(out, job);
         }
         return job;
@@ -254,8 +265,9 @@ export async function seekableCopies(files, root, { signal, plays, slow = true, 
   return copies;
 }
 
-/** The end of a master export's copy's name, beside the preview's `.mp4`. */
+/** The end of a master export's copy's name, beside the preview's `.mp4` (`.webm` for a browser without H.264). */
 const FINE = '-fine.mp4';
+const FINE_WEBM = '-fine.webm';
 
 /** @type {Map<string, Promise<'made' | 'failed' | 'cancelled'>>} the copies being made in this process, by their path */
 const making = new Map();
@@ -266,7 +278,8 @@ const making = new Map();
  * already there (Windows, while a browser reads it) uses that copy.
  * `fine`: x264 on the processor at a quality near lossless, its grain kept (the chip's encoder at its bitrate smooths a
  * dark gradient's dither into bands).
- * @param {string} file @param {string} out @param {{ fps: number, w: number, h: number, alpha: boolean, scaled?: true }} need @param {AbortSignal} [signal]
+ * `need.vp9`: VP9 on the processor (with its alpha when it has one), for an alpha or a browser without H.264.
+ * @param {string} file @param {string} out @param {{ fps: number, w: number, h: number, alpha: boolean, scaled?: true, vp9?: boolean }} need @param {AbortSignal} [signal]
  * @param {boolean} [fine]
  * @returns {Promise<'made' | 'failed' | 'cancelled'>}
  */
@@ -286,7 +299,7 @@ async function makeCopy(file, out, need, signal, fine = false) {
     /* the same frames at the same times (passthrough: no frame is added or dropped), the picture only */
     const run = ffmpeg([...decoding, '-i', file, '-map', '0:v:0', '-an', '-sn', '-dn', '-fps_mode', 'passthrough',
       ...(need.scaled ? ['-vf', `scale=${need.w}:${need.h}`] : []),
-      ...(need.alpha ? ['-c:v', 'libvpx-vp9', '-pix_fmt', 'yuva420p', '-b:v', '0', '-crf', '18', '-row-mt', '1', '-deadline', 'realtime', '-cpu-used', '8',
+      ...(need.alpha || need.vp9 ? ['-c:v', 'libvpx-vp9', '-pix_fmt', need.alpha ? 'yuva420p' : 'yuv420p', '-b:v', '0', '-crf', fine ? '10' : '18', '-row-mt', '1', '-deadline', 'realtime', '-cpu-used', '8',
         '-g', String(gop), '-keyint_min', String(gop), '-auto-alt-ref', '0']
         : encoder ? ['-pix_fmt', 'nv12', ...hardwareOptions(encoder, bits, { gop }), ...h264ColorTags(await colorTagsOf(file))]
           : ['-c:v', 'libx264', ...(fine ? ['-preset', 'veryfast', '-crf', '8', '-tune', 'grain'] : ['-preset', 'superfast', '-crf', '16']), '-g', String(gop), '-keyint_min', String(gop), '-pix_fmt', 'yuv420p']), part]);
@@ -319,7 +332,7 @@ async function makeCopy(file, out, need, signal, fine = false) {
   try {
     /* one with an alpha all on the processor: the chip's decoding (VideoToolbox) drops an HEVC's alpha layer, and says
        nothing */
-    if (need.alpha || fine) await make(null, []);
+    if (need.alpha || need.vp9 || fine) await make(null, []);
     else await onTheChip(await hardwareEncoder('h264', await encoders()), make, signal);
   } catch {
     drop();
