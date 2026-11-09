@@ -180,7 +180,7 @@ export default {
       const sec = clamp(number(args.sec) ?? 5, 1, 47);
       const ckpts = /** @type {any} */ (await (await ask(`${COMFY}/object_info/CheckpointLoaderSimple`, {}, ctx.signal)).json())?.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0] ?? [];
       if (!ckpts.includes('stable-audio-open-1.0.safetensors')) {
-        throw new Error(`${NAME} : le modèle d'effets sonores n'est pas encore sur le DGX (accès à accepter sur https://huggingface.co/stabilityai/stable-audio-open-1.0, puis ~/openfilm-docker/telecharger-stable-audio.sh).`);
+        throw new Error(`${NAME} : le modèle d'effets sonores n'est pas encore sur le DGX (lancer ~/openfilm-docker/telecharger-stable-audio.sh sur spark-1540).`);
       }
       const graph = {
         1: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: 'stable-audio-open-1.0.safetensors' } },
