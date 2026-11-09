@@ -105,8 +105,8 @@ export function contextLength(/** @type {unknown} */ value) {
 /**
  * One of the person's own models as the agent runs it: `id` (the app's, never shown), `name` (the menu's), Pi's `api`,
  * the service's `baseUrl`, the variable its key is in (`keyEnv`), the `model` asked for there, its efforts and its
- * `context` length in tokens (128K when none).
- * @typedef {{ id: string, name: string, api: string, baseUrl: string, keyEnv: string, model: string, levels: string[], effort: string, context?: number, compat?: Record<string, unknown> }} OwnModel
+ * `context` length in tokens (128K when none), and what it reads (`input`: text and pictures when not given).
+ * @typedef {{ id: string, name: string, api: string, baseUrl: string, keyEnv: string, model: string, levels: string[], effort: string, context?: number, compat?: Record<string, unknown>, input?: string[] }} OwnModel
  */
 
 /** Pi's provider for one of the person's own models: each its own service. */
@@ -130,7 +130,8 @@ export function modelsJson(models) {
     return {
       id: m.model,
       name: m.name,
-      input: ['text', 'image'],
+      /* what it can be shown: pictures too unless the service says it takes text only (a local model without vision) */
+      input: m.input ?? ['text', 'image'],
       contextWindow: context,
       maxTokens: Math.min(Math.floor(context / 4), MAX_OUTPUT),
       reasoning: Boolean(levels),

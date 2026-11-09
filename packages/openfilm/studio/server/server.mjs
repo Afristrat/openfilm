@@ -78,6 +78,7 @@ import { LOCATION_KEYS, chooseFolder, locations, usableFolder } from '../../src/
 import { doctor } from '../../src/doctor.mjs';
 import { recentProblems } from '../../src/problems.mjs';
 import { exportDiagnostics } from './diagnostics.mjs';
+import { agentConfig, createAgentHub, startPiSession } from './agent.mjs';
 
 /** @typedef {import('./http.mjs').Req} Req @typedef {import('./http.mjs').Res} Res */
 
@@ -140,8 +141,15 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   let making = 0;
   /** the update run from the top bar: `{ status: 'updating' | 'failed', version, error? }` (see /api/update) */
   let updating = /** @type {{ status: 'updating' | 'failed', version: string, error?: string } | null} */ (null);
-  /** whether an app's agent is working in the project at `path` now */
-  const agentIn = (/** @type {string} */ path) => working().some((folder) => resolve(folder) === resolve(path));
+  /* the agent of Studio served to a browser (agent.mjs): off, and the page says so, when this server names no model */
+  let agentSettings = /** @type {ReturnType<typeof agentConfig>} */ (null);
+  try { agentSettings = agentConfig(); } catch (e) { console.error(e instanceof Error ? e.message : e); }
+  const agents = createAgentHub({
+    config: agentSettings,
+    start: (project, onUpdate) => startPiSession(project, onUpdate, { config: /** @type {NonNullable<typeof agentSettings>} */ (agentSettings) }),
+  });
+  /** whether an app's agent, or the browser's, is working in the project at `path` now */
+  const agentIn = (/** @type {string} */ path) => [...working(), ...agents.working()].some((folder) => resolve(folder) === resolve(path));
   /* the person's edits kept over an agent's writes, the texts a merge read and wrote kept aside in the history */
   personEdits.configure({ keep: keepAside });
   /** The project at `root`'s history changed: its pages hear of it. `moved`: the folder's files changed with it. */
@@ -1247,6 +1255,16 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
         if (send) stop = projectStream(project, send);
         return;
       }
+      /* the project's agent (agent.mjs): the page's messages in, every turn out */
+      if (parts.length === 4 && parts[0] === 'api' && parts[1] === 'projects' && parts[3] === 'agent') {
+        const project = await projectById(parts[2]).catch(() => null);
+        if (!project || project.missing) return refuse('404 Not Found');
+        /** @type {ReturnType<typeof agents.join> | null} */
+        let page = null;
+        const send = acceptWebSocket(req, socket, () => page?.leave(), (text) => page?.said(text));
+        if (send) page = agents.join(project, send);
+        return;
+      }
       refuse('404 Not Found');
     })().catch(() => refuse('500 Internal Server Error'));
   });
@@ -1294,6 +1312,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
     autoVersions.stop();
     await closePageFrames();
     watchers.closeAll();
+    agents.closeAll();
     await pages.close();
     editor.closeAllConnections();
     for (const socket of streamSockets) socket.destroy();

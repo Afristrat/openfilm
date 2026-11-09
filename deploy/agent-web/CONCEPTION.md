@@ -35,7 +35,30 @@ Ce que l'hôte web implémente :
 ## Étapes
 
 1. Hôte web minimal : `panel` + `assets` (le panneau Media s'ouvre dans le panneau), vérifié dans un navigateur.
-2. Route serveur `agent` (WebSocket) et processus agent dans le dossier du projet ; un message aller-retour prouvé.
+2. Route serveur `agent` (WebSocket) et processus agent dans le dossier du projet ; un message aller-retour prouvé (réalisée, voir plus bas).
 3. Outils : le CLI `openfilm` complet ; premier cas réel, le montage « Projet Bouchra ».
 4. `refer`, `ask`, `onSelection` ; Settings → Agents (modèle, passerelle).
 5. File des travaux lourds et plafonds ; rendu vérifié de bout en bout.
+
+## Réalisation de l'étape 2 (2026-11-09)
+
+- L'agent n'est pas réécrit : c'est celui de l'application de bureau (Pi, `apps/desktop/src/pi-agent.mjs`, par sa classe
+  `AgentSession`), du Node pur sans Electron, lancé par le serveur Studio (`studio/server/agent.mjs`) dans le dossier du
+  projet, avec la commande `openfilm` en tête de son PATH et les compétences d'OpenFilm (edit, media, canvas).
+- Transport : WebSocket `/api/projects/:id/agent`, derrière le même contrôle de clé et d'origine que les flux de Studio.
+  Un agent par projet ; toutes les pages ouvertes sur le projet voient chaque tour ; un tour à la fois ; l'agent s'arrête
+  après 15 minutes sans page ni travail, sa conversation reprise au démarrage suivant (`.film/agent/web.json`).
+- Modèle : nommé par l'environnement (`OPENFILM_AGENT_BASE_URL`, `OPENFILM_AGENT_MODEL`, `OPENFILM_AGENT_NAME`,
+  `OPENFILM_AGENT_VISION`), jamais par le code ; clé dans un fichier du volume (`/root/.openfilm/agent/litellm.key`),
+  clé LiteLLM d'alias `openfilm-agent` bornée au seul modèle choisi (prouvé : 200 sur ce modèle, 403 sur un modèle payant).
+- Modèle retenu : `qwen3.8-27b` (spark-550f, par la passerelle), appel d'outils prouvé. **Il ne lit pas les images**
+  (le serveur répond « served with --vision » requis) : l'agent est déclaré texte seul (`input: ['text']`, ajouté à
+  `pi-config.mjs`), Pi remplace alors chaque image par une mention. Mesuré le 2026-11-09 : les modèles locaux avec vision
+  de la passerelle (`gemma4-26b-local`, `qwen2.5vl-7b-local`) échouent (Pillow absent du conteneur LiteLLM) ;
+  `gemini-2.5-flash-lite` voit un carré rouge « bleu » ; `gemini-3.1-flash-lite` répond juste mais est payant.
+- Sécurité, risque résiduel : Pi exécute `bash` sans bac à sable, en root dans le conteneur Studio (réseau de l'hôte).
+  Ce qu'il peut lire de sensible se limite à la clé de Studio (dont il a besoin pour `openfilm`) et à sa propre clé
+  bornée ; `providers.json` ne contient aucune clé (vérifié). Le risque restant est l'accès au réseau local depuis une
+  commande, par exemple sur injection de consigne via une page lue par `openfilm get web-fetch`. L'accès à la page reste
+  fermé par le mot de passe du relais et la clé de Studio.
+- Demandes de permission et questions de l'agent : refusées pour l'instant (étape 4).

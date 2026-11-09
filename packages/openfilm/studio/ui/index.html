@@ -21,14 +21,15 @@
  * desktop app gives Studio its chat panel and a place for the project's media; a browser has neither. This one gives
  * both, drawn in Studio's page: a panel on the left under the top bar, where the media pool opens above its composer.
  * Loaded before Studio's own script (index.html), and only where no app gave Studio a host already.
- * deploy/agent-web/CONCEPTION.md says where the agent itself comes in.
+ * The agent's part talks to the project's agent on the server (studio/server/agent.mjs, deploy/agent-web/CONCEPTION.md).
  */
 (function () {
   if (globalThis.openfilmHost) return;
   var KEY = 'openfilm.webHost.panel';
   var saved = {};
   try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { saved = {}; }
-  var COMPOSER = 132;
+  /* the agent's part of the panel, at its bottom: the conversation and where to write; Studio's media above it */
+  var COMPOSER = 320;
   var state = {
     open: saved.open !== false,
     width: saved.width || 380,
@@ -36,6 +37,7 @@
   };
   var listeners = [];
   var el = null;
+  var ui = {};
   var keep = function () {
     try { localStorage.setItem(KEY, JSON.stringify({ open: state.open, width: state.width, assetsOpen: state.assets.open })); } catch (e) { /* private window */ }
   };
@@ -46,20 +48,53 @@
     listeners.forEach(function (l) { try { l(shown); } catch (e) { /* a listener's own failure */ } });
   };
   var bounds = null;
+  var BORDER = 'var(--border,#2a2a2a)';
+  function make(tag, css, text) {
+    var n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (text != null) n.textContent = text;
+    return n;
+  }
   function draw() {
     if (!document.body) return;
     if (!el) {
       el = document.createElement('aside');
       el.setAttribute('data-studio-host-panel', '');
       el.setAttribute('aria-label', 'Agent');
-      /* transparent above the composer: Studio draws the project's media there (panel.assets) */
+      /* transparent above the agent's part: Studio draws the project's media there (panel.assets) */
       el.style.cssText = 'position:fixed;z-index:30;display:flex;flex-direction:column;justify-content:flex-end;box-sizing:border-box;pointer-events:none;'
         + 'color:var(--text,#e8e8e8);font:13px/1.45 system-ui,sans-serif';
-      el.innerHTML = '<div data-composer style="pointer-events:auto;background:var(--bg,#151515);border-right:1px solid var(--border,#2a2a2a);box-sizing:border-box;height:' + COMPOSER + 'px;padding:12px;border-top:1px solid var(--border,#2a2a2a)">'
-        + '<div style="font-weight:600;margin-bottom:6px">Agent du DGX</div>'
-        + '<textarea disabled rows="3" placeholder="La conversation avec l\'agent arrive à l\'étape suivante." '
-        + 'style="width:100%;box-sizing:border-box;resize:none;border-radius:8px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:8px;font:inherit"></textarea></div>';
+      var box = make('div', 'pointer-events:auto;background:var(--bg,#151515);border-right:1px solid ' + BORDER + ';border-top:1px solid ' + BORDER
+        + ';box-sizing:border-box;height:' + COMPOSER + 'px;padding:10px 12px;display:flex;flex-direction:column;gap:6px');
+      box.setAttribute('data-composer', '');
+      var head = make('div', 'display:flex;align-items:baseline;gap:8px');
+      head.appendChild(make('div', 'font-weight:600', 'Agent du DGX'));
+      ui.status = make('div', 'opacity:.65;font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis', '');
+      head.appendChild(ui.status);
+      ui.log = make('div', 'flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px');
+      ui.log.setAttribute('aria-live', 'polite');
+      ui.input = make('textarea', 'width:100%;box-sizing:border-box;resize:none;border-radius:8px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:8px;font:inherit');
+      ui.input.rows = 2;
+      ui.input.setAttribute('aria-label', 'Message pour l’agent');
+      ui.input.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+      });
+      var row = make('div', 'display:flex;gap:6px;justify-content:flex-end');
+      ui.stop = make('button', 'border-radius:6px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:4px 10px;font:inherit;cursor:pointer', 'Arrêter');
+      ui.stop.type = 'button';
+      ui.stop.addEventListener('click', function () { say({ type: 'cancel' }); });
+      ui.go = make('button', 'border-radius:6px;border:0;background:var(--accent,#3b82f6);color:#fff;padding:4px 12px;font:inherit;cursor:pointer', 'Envoyer');
+      ui.go.type = 'button';
+      ui.go.addEventListener('click', send);
+      row.appendChild(ui.stop);
+      row.appendChild(ui.go);
+      box.appendChild(head);
+      box.appendChild(ui.log);
+      box.appendChild(ui.input);
+      box.appendChild(row);
+      el.appendChild(box);
       document.body.appendChild(el);
+      refresh();
     }
     var top = 40;
     var b = bounds || { left: 0, top: top, width: state.width, height: window.innerHeight - top };
@@ -69,11 +104,113 @@
     el.style.width = b.width + 'px';
     el.style.height = b.height + 'px';
   }
+
+  /* the conversation with the project's agent (studio/server/agent.mjs): one socket per project open */
+  var agent = { project: null, ws: null, ready: false, available: false, busy: false, model: null, reply: null, tools: {}, retry: 0, timer: null };
+  function projectFromAddress() {
+    var m = /^\/projects\/([\w-]+)/.exec(location.pathname);
+    return m ? m[1] : null;
+  }
+  function refresh() {
+    if (!ui.status) return;
+    var text = !agent.project ? 'Ouvrez un projet pour parler à l’agent.'
+      : !agent.ready ? 'Connexion…'
+      : !agent.available ? 'Aucun modèle n’est configuré sur ce serveur.'
+      : agent.busy ? 'L’agent travaille…'
+      : 'Prêt' + (agent.model ? ' · ' + agent.model : '');
+    ui.status.textContent = text;
+    var usable = Boolean(agent.project && agent.ready && agent.available);
+    ui.input.disabled = !usable;
+    ui.input.placeholder = usable ? 'Demandez à l’agent (Entrée pour envoyer, Maj+Entrée pour aller à la ligne)' : text;
+    ui.go.disabled = !usable || agent.busy;
+    ui.stop.style.display = agent.busy ? '' : 'none';
+  }
+  function bubble(who, text) {
+    var mine = who === 'person';
+    var n = make('div', 'white-space:pre-wrap;word-break:break-word;border-radius:8px;padding:6px 8px;max-width:92%;'
+      + (mine ? 'align-self:flex-end;background:var(--accent,#3b82f6);color:#fff' : who === 'error' ? 'background:rgba(220,38,38,.18);color:#fca5a5' : 'background:var(--panel,#1f1f1f)'), text);
+    ui.log.appendChild(n);
+    ui.log.scrollTop = ui.log.scrollHeight;
+    return n;
+  }
+  function toolLine(title, status) {
+    var n = make('div', 'font-size:12px;opacity:.7;padding-left:4px', '');
+    setTool(n, title, status);
+    ui.log.appendChild(n);
+    ui.log.scrollTop = ui.log.scrollHeight;
+    return n;
+  }
+  function setTool(n, title, status) {
+    var mark = status === 'completed' ? '✓' : status === 'failed' ? '✗' : '…';
+    n.textContent = mark + ' ' + (title || 'outil');
+  }
+  function heard(event) {
+    if (event.kind === 'ready') { agent.ready = true; agent.available = event.available; agent.busy = event.busy; agent.model = event.model; agent.retry = 0; }
+    else if (event.kind === 'turn') { agent.busy = true; agent.reply = null; agent.tools = {}; bubble('person', event.text); }
+    else if (event.kind === 'busy') bubble('error', 'L’agent travaille déjà : attendez la fin de son tour, ou arrêtez-le.');
+    else if (event.kind === 'error') { agent.busy = false; agent.reply = null; bubble('error', event.message || 'Erreur'); }
+    else if (event.kind === 'done') { agent.busy = false; agent.reply = null; if (event.stopReason === 'cancelled') bubble('error', 'Tour arrêté.'); }
+    else if (event.kind === 'update') {
+      var u = event.update || {};
+      if (u.sessionUpdate === 'agent_message_chunk' && u.content && u.content.type === 'text') {
+        if (!agent.reply) agent.reply = bubble('agent', '');
+        agent.reply.textContent += u.content.text;
+        ui.log.scrollTop = ui.log.scrollHeight;
+      } else if (u.sessionUpdate === 'tool_call') {
+        agent.reply = null;
+        agent.tools[u.toolCallId] = { node: toolLine(u.title, u.status), title: u.title };
+      } else if (u.sessionUpdate === 'tool_call_update' && agent.tools[u.toolCallId]) {
+        var t = agent.tools[u.toolCallId];
+        if (u.title) t.title = u.title;
+        setTool(t.node, t.title, u.status);
+      }
+    }
+    refresh();
+  }
+  function say(message) {
+    if (agent.ws && agent.ws.readyState === 1) agent.ws.send(JSON.stringify(message));
+  }
+  function send() {
+    var text = ui.input.value.trim();
+    if (!text || ui.go.disabled) return;
+    say({ type: 'prompt', text: text });
+    ui.input.value = '';
+  }
+  function connect() {
+    if (agent.timer) { clearTimeout(agent.timer); agent.timer = null; }
+    if (agent.ws) { agent.ws.onclose = null; agent.ws.close(); agent.ws = null; }
+    agent.ready = false; agent.busy = false; agent.reply = null; agent.tools = {};
+    if (ui.log) ui.log.textContent = '';
+    refresh();
+    if (!agent.project) return;
+    var ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/projects/' + encodeURIComponent(agent.project) + '/agent');
+    agent.ws = ws;
+    ws.onmessage = function (m) { try { heard(JSON.parse(m.data)); } catch (e) { /* not ours */ } };
+    ws.onclose = function () {
+      if (agent.ws !== ws) return;
+      agent.ws = null; agent.ready = false; refresh();
+      /* the server restarted or the network went: again, a little later each time */
+      agent.retry = Math.min(agent.retry + 1, 6);
+      agent.timer = setTimeout(connect, 1000 * agent.retry);
+    };
+  }
+  function follow(id) {
+    if (id === agent.project) return;
+    agent.project = id;
+    connect();
+  }
+  window.addEventListener('popstate', function () { follow(projectFromAddress()); });
+  /* Studio changes its address itself (history.pushState): followed on each change of path */
+  var lastPath = location.pathname;
+  setInterval(function () { if (location.pathname !== lastPath) { lastPath = location.pathname; follow(projectFromAddress()); } }, 1000);
+
   window.addEventListener('resize', draw);
-  document.addEventListener('DOMContentLoaded', draw);
+  document.addEventListener('DOMContentLoaded', function () { draw(); follow(projectFromAddress()); });
   globalThis.openfilmHost = {
     version: 1,
     name: 'OpenFilm (navigateur)',
+    /* the project Studio shows: its agent is the one the panel talks to */
+    projectChanged: function (project) { if (project && project.id) follow(project.id); },
     panel: {
       label: 'Agent',
       get open() { return state.open; },

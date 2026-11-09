@@ -22,6 +22,12 @@ test("each of the person's models is a provider of its own in Pi's models.json: 
   assert.equal(model.reasoning, false);
 });
 
+test('a model that reads text only is told so to Pi, which then leaves pictures out of its requests', () => {
+  const model = (over) => modelsJson([own('a', over)]).providers[providerOf('a')].models[0];
+  assert.deepEqual(model({ input: ['text'] }).input, ['text']);
+  assert.deepEqual(model({}).input, ['text', 'image'], 'none said: text and pictures, as before');
+});
+
 test("a model's context length is its window in Pi, and a quarter of it its answers, never more than 32K", () => {
   const model = (over) => modelsJson([own('a', over)]).providers[providerOf('a')].models[0];
   assert.deepEqual([model({}).contextWindow, model({}).maxTokens], [128_000, 32_000], 'none given: 128K, as before');
