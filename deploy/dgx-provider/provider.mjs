@@ -25,11 +25,16 @@ const MODELS = {
   music: [{ id: 'ace-step-1.5-turbo', name: 'ACE-Step 1.5 Turbo' }],
   /* Stable Audio Open 1.0 (ComfyUI natif : ConditioningStableAudio, encodeur t5_base), jusqu'à 47 s */
   sfx: [{ id: 'stable-audio-open-1.0', name: 'Stable Audio Open 1.0' }],
-  /* Wan 2.2 TI2V 5B : 24 images/s, 1 à 5 s (2 s en environ 2 min 30 sur le GB10, mesuré le 2026-11-08) ; image de départ
-     possible (--first-frame), pas d'image de fin */
-  video: [{ id: 'wan2.2-ti2v-5b', name: 'Wan 2.2 TI2V 5B', spec: { ratios: ['16:9', '9:16', '1:1'], seconds: /** @type {[number, number]} */ ([1, 5]), frames: true } }],
+  /* LTX 2.3 22B fp8, branche distillée (LoRA 384, 8 pas) : image ET son, 24 images/s ; à chaud sur le GB10, 2 s en 50 s et
+     5 s en 114 s en 1280×704 (mesuré le 2026-11-09). Wan 2.2 TI2V 5B, sans son : 2 s en environ 2 min 30 (2026-11-08).
+     Image de départ possible (--first-frame) pour les deux, pas d'image de fin. */
+  video: [
+    { id: 'ltx-2.3-distilled', name: 'LTX 2.3 22B (distillé, avec son)', spec: { ratios: ['16:9', '9:16', '1:1'], seconds: /** @type {[number, number]} */ ([1, 10]), frames: true } },
+    { id: 'wan2.2-ti2v-5b', name: 'Wan 2.2 TI2V 5B', spec: { ratios: ['16:9', '9:16', '1:1'], seconds: /** @type {[number, number]} */ ([1, 5]), frames: true } },
+  ],
 };
-/** la taille native de Wan 2.2 TI2V par format (multiples de 32) */
+const LTX = 'ltx-2.3-22b-dev-fp8.safetensors';
+/** la taille native de Wan 2.2 TI2V et de LTX 2.3 par format (multiples de 32) */
 const VIDEO_SIZE = /** @type {Record<string, [number, number]>} */ ({ '16:9': [1280, 704], '9:16': [704, 1280], '1:1': [960, 960] });
 /** les voix de higgs : id, nom, langue, genre (inventaire du 2026-11-08) */
 const VOICES = /** @type {[string, string, string, 'm' | 'f'][]} */ ([
@@ -207,11 +212,65 @@ export default {
       const model = modelOf(MODELS, 'video', ctx);
       const ratio = text(args['aspect-ratio']) || '16:9';
       const [width, height] = VIDEO_SIZE[ratio] ?? VIDEO_SIZE['16:9'];
-      const sec = clamp(number(args.duration) ?? 3, 1, 5);
-      /* Wan prend 4n + 1 images */
-      const length = Math.round((sec * 24) / 4) * 4 + 1;
+      const ltx = model === 'ltx-2.3-distilled';
+      const sec = clamp(number(args.duration) ?? 3, 1, ltx ? 10 : 5);
+      /* Wan prend 4n + 1 images, LTX 8n + 1 */
+      const step = ltx ? 8 : 4;
+      const length = Math.round((sec * 24) / step) * step + 1;
       const said = /** @type {string[]} */ ([]);
-      if (text(args['last-frame'])) said.push('Wan 2.2 TI2V ne prend pas d\'image de fin : --last-frame ignoré');
+      if (text(args['last-frame'])) said.push(`${ltx ? 'LTX 2.3' : 'Wan 2.2 TI2V'} ne prend pas d'image de fin ici : --last-frame ignoré`);
+      const first = text(args['first-frame']);
+      /** l'image de départ, déposée chez ComfyUI ; son nom dans ComfyUI */
+      const upload = async () => {
+        const form = new FormData();
+        form.set('image', new Blob([await ctx.read(first)]), `openfilm-${Date.now()}-${first.split('/').pop()}`);
+        form.set('overwrite', 'true');
+        const up = /** @type {any} */ (await (await ask(`${COMFY}/upload/image`, { method: 'POST', body: form }, ctx.signal)).json());
+        return String(up?.name ?? '');
+      };
+      if (ltx) {
+        /* graphe repris du modèle « 02_ltx2.3_T2V_I2V_distilled » du DGX, branche distillée (sigmas manuelles, CFG 1) */
+        /** @type {Record<string, unknown>} */
+        const graph = {
+          1: { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: LTX } },
+          2: { class_type: 'LoraLoaderModelOnly', inputs: { model: ['1', 0], lora_name: 'ltx-2.3-22b-distilled-lora-384.safetensors', strength_model: 0.5 } },
+          3: { class_type: 'LTXAVTextEncoderLoader', inputs: { text_encoder: 'gemma_3_12B_it_fp4_mixed.safetensors', ckpt_name: LTX, device: 'default' } },
+          4: { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: prompt } },
+          5: { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: 'pc game, console game, video game, cartoon, childish, ugly' } },
+          6: { class_type: 'LTXVConditioning', inputs: { positive: ['4', 0], negative: ['5', 0], frame_rate: 24 } },
+          7: { class_type: 'EmptyLTXVLatentVideo', inputs: { width, height, length, batch_size: 1 } },
+          8: { class_type: 'LTXVAudioVAELoader', inputs: { ckpt_name: LTX } },
+          9: { class_type: 'LTXVEmptyLatentAudio', inputs: { frames_number: length, frame_rate: 24, batch_size: 1, audio_vae: ['8', 0] } },
+          10: { class_type: 'LTXVConcatAVLatent', inputs: { video_latent: ['7', 0], audio_latent: ['9', 0] } },
+          11: { class_type: 'CFGGuider', inputs: { model: ['2', 0], positive: ['6', 0], negative: ['6', 1], cfg: 1 } },
+          12: { class_type: 'KSamplerSelect', inputs: { sampler_name: 'euler_ancestral_cfg_pp' } },
+          13: { class_type: 'ManualSigmas', inputs: { sigmas: '1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0' } },
+          14: { class_type: 'RandomNoise', inputs: { noise_seed: seed() } },
+          15: { class_type: 'SamplerCustomAdvanced', inputs: { noise: ['14', 0], guider: ['11', 0], sampler: ['12', 0], sigmas: ['13', 0], latent_image: ['10', 0] } },
+          16: { class_type: 'LTXVSeparateAVLatent', inputs: { av_latent: ['15', 0] } },
+          17: { class_type: 'LTXVTiledVAEDecode', inputs: { vae: ['1', 2], latents: ['16', 0], horizontal_tiles: 2, vertical_tiles: 2, overlap: 6, last_frame_fix: false } },
+          18: { class_type: 'LTXVAudioVAEDecode', inputs: { samples: ['16', 1], audio_vae: ['8', 0] } },
+          19: { class_type: 'CreateVideo', inputs: { images: ['17', 0], audio: ['18', 0], fps: 24.0 } },
+          20: { class_type: 'SaveVideo', inputs: { video: ['19', 0], filename_prefix: 'openfilm', format: 'auto', codec: 'auto' } },
+        };
+        if (first) {
+          /* l'image de départ, à la taille de la vidéo, compressée comme dans le modèle du DGX, puis posée sur la première image */
+          graph[21] = { class_type: 'LoadImage', inputs: { image: await upload() } };
+          graph[22] = { class_type: 'ImageScale', inputs: { image: ['21', 0], upscale_method: 'lanczos', width, height, crop: 'center' } };
+          graph[23] = { class_type: 'LTXVPreprocess', inputs: { image: ['22', 0], img_compression: 18 } };
+          graph[24] = { class_type: 'LTXVImgToVideoConditionOnly', inputs: { vae: ['1', 2], image: ['23', 0], latent: ['7', 0], strength: 0.7, bypass: false } };
+          /** @type {any} */ (graph[10]).inputs.video_latent = ['24', 0];
+        }
+        ctx.say(`LTX 2.3 sur le DGX : ${sec} s en ${width}×${height} avec le son, compter environ ${Math.ceil((20 + sec * 20) / 60)} min (plus 1 min au premier chargement)`);
+        const made = await comfy(graph, 'images', ctx);
+        const path = landing('video', args.out, 'mp4');
+        return {
+          files: [{ path, bytes: made.bytes }],
+          index: [{ src: path, kind: 'video', dur: round((length - 1) / 24), w: width, h: height, from: { mode: 'generate', prompt, provider: 'dgx', model } }],
+          receipt: { provider: 'dgx', model, src: path, dur: round((length - 1) / 24), width, height, ...notes(said) },
+          cost: { note: 'gratuit, sur le DGX' },
+        };
+      }
       /** @type {Record<string, unknown>} */
       const latent = { vae: ['3', 0], width, height, length, batch_size: 1 };
       /** @type {Record<string, unknown>} */
@@ -229,14 +288,9 @@ export default {
         10: { class_type: 'CreateVideo', inputs: { images: ['9', 0], fps: 24.0 } },
         11: { class_type: 'SaveVideo', inputs: { video: ['10', 0], filename_prefix: 'openfilm', format: 'auto', codec: 'auto' } },
       };
-      const first = text(args['first-frame']);
       if (first) {
         /* l'image de départ, déposée chez ComfyUI puis chargée dans le graphe */
-        const form = new FormData();
-        form.set('image', new Blob([await ctx.read(first)]), `openfilm-${Date.now()}-${first.split('/').pop()}`);
-        form.set('overwrite', 'true');
-        const up = /** @type {any} */ (await (await ask(`${COMFY}/upload/image`, { method: 'POST', body: form }, ctx.signal)).json());
-        graph[12] = { class_type: 'LoadImage', inputs: { image: String(up?.name ?? '') } };
+        graph[12] = { class_type: 'LoadImage', inputs: { image: await upload() } };
         latent.start_image = ['12', 0];
       }
       ctx.say(`Wan 2.2 sur le DGX : ${sec} s en ${width}×${height}, compter environ ${Math.ceil(sec * 75 / 60)} min`);
