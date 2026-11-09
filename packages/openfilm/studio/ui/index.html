@@ -44,6 +44,7 @@
   var tell = function () {
     keep();
     draw();
+    refresh();
     var shown = { open: state.open, width: state.open ? state.width : 0, preferredWidth: state.width, assets: { open: state.assets.open, bottom: COMPOSER } };
     listeners.forEach(function (l) { try { l(shown); } catch (e) { /* a listener's own failure */ } });
   };
@@ -71,6 +72,11 @@
       head.appendChild(make('div', 'font-weight:600', 'Agent du DGX'));
       ui.status = make('div', 'opacity:.65;font-size:12px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis', '');
       head.appendChild(ui.status);
+      /* the project's media, in the drawer above: Studio keeps it closed by default under a host (lib/workspaces.ts) */
+      ui.media = make('button', 'border-radius:6px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:2px 8px;font:inherit;font-size:12px;cursor:pointer', 'Médias');
+      ui.media.type = 'button';
+      ui.media.addEventListener('click', function () { state.assets.open = !state.assets.open; tell(); });
+      head.appendChild(ui.media);
       ui.log = make('div', 'flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:6px;padding-right:2px');
       ui.log.setAttribute('aria-live', 'polite');
       ui.input = make('textarea', 'width:100%;box-sizing:border-box;resize:none;border-radius:8px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:8px;font:inherit');
@@ -113,6 +119,8 @@
   }
   function refresh() {
     if (!ui.status) return;
+    ui.media.setAttribute('aria-pressed', String(state.assets.open));
+    ui.media.textContent = state.assets.open ? 'Masquer les médias' : 'Médias';
     var text = !agent.project ? 'Ouvrez un projet pour parler à l’agent.'
       : !agent.ready ? 'Connexion…'
       : !agent.available ? 'Aucun modèle n’est configuré sur ce serveur.'
@@ -144,6 +152,22 @@
     var mark = status === 'completed' ? '✓' : status === 'failed' ? '✗' : '…';
     n.textContent = mark + ' ' + (title || 'outil');
   }
+  /* the references the agent writes for Studio (agents.mjs STUDIO_REFERENCES), as a person reads them */
+  function clock(s) {
+    var t = Math.max(0, Math.round(Number(s) || 0));
+    var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), x = t % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(x).padStart(2, '0');
+  }
+  function readable(text) {
+    return text.replace(/\[\[(\w+):([^\]]*)\]\]/g, function (all, kind, what) {
+      if (kind === 'file') return '« ' + what.split('/').pop() + ' »';
+      if (kind === 't') return clock(what);
+      if (kind === 'range') { var r = what.split('-'); return clock(r[0]) + ' à ' + clock(r[1]); }
+      if (kind === 'track') return 'piste ' + what;
+      if (kind === 'clip') return 'le plan ' + what;
+      return all;
+    });
+  }
   function heard(event) {
     if (event.kind === 'ready') { agent.ready = true; agent.available = event.available; agent.busy = event.busy; agent.model = event.model; agent.retry = 0; }
     else if (event.kind === 'turn') { agent.busy = true; agent.reply = null; agent.tools = {}; bubble('person', event.text); }
@@ -153,8 +177,9 @@
     else if (event.kind === 'update') {
       var u = event.update || {};
       if (u.sessionUpdate === 'agent_message_chunk' && u.content && u.content.type === 'text') {
-        if (!agent.reply) agent.reply = bubble('agent', '');
-        agent.reply.textContent += u.content.text;
+        if (!agent.reply) { agent.reply = bubble('agent', ''); agent.reply.raw = ''; }
+        agent.reply.raw += u.content.text;
+        agent.reply.textContent = readable(agent.reply.raw);
         ui.log.scrollTop = ui.log.scrollHeight;
       } else if (u.sessionUpdate === 'tool_call') {
         agent.reply = null;
