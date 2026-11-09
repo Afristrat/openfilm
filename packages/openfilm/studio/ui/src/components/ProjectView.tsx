@@ -164,6 +164,8 @@ import { isTextField, isTypingTarget } from './typing-target';
 
 /** How far a caption track's translation sits above it (% of the frame): about a line. */
 const TRANSLATION_LIFT_PCT = 7;
+/** An import bigger than this goes in parts of this size (onImport): under the 100 MB a proxy such as Cloudflare lets by. */
+const UPLOAD_PART = 64 * 1024 * 1024;
 
 const PANE = 'relative flex min-h-0 min-w-0 flex-col overflow-hidden';
 /** The files a picture inside a page can be replaced with. */
@@ -3690,20 +3692,37 @@ export function ProjectView({ projectId, onProject, onLeave }: {
       return landed;
     }
     for (const [i, file] of files.entries()) {
-      // eslint-disable-next-line no-await-in-loop
-      const { ok, body } = await new Promise<{ ok: boolean; body: { path?: string; error?: string; unreadable?: string } }>((done) => {
+      const target = `${projectApi}/files?path=${encodeURIComponent(`${into}/${file.name}`)}`;
+      /* one request of `blob` (bytes `from` of the file), its progress the file's */
+      const send = (url: string, blob: Blob, from: number) => new Promise<{ ok: boolean; status: number; body: { path?: string; error?: string; unreadable?: string } }>((done) => {
         const xhr = new XMLHttpRequest();
-        xhr.open('PUT', `${projectApi}/files?path=${encodeURIComponent(`${into}/${file.name}`)}`);
-        xhr.upload.onprogress = (e) => { if (e.lengthComputable && e.total > 0) onProgress(i, Math.min(0.99, e.loaded / e.total)); };
+        xhr.open('PUT', url);
+        xhr.upload.onprogress = (e) => { if (e.lengthComputable && file.size > 0) onProgress(i, Math.min(0.99, (from + e.loaded) / file.size)); };
         xhr.onload = () => {
           let body = {};
           try { body = JSON.parse(xhr.responseText); } catch { /* no answer to read */ }
-          done({ ok: xhr.status >= 200 && xhr.status < 300, body });
+          done({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status, body });
         };
-        xhr.onerror = () => done({ ok: false, body: {} });
-        xhr.send(file);
+        xhr.onerror = () => done({ ok: false, status: 0, body: {} });
+        xhr.send(blob);
       });
-      if (!ok) throw new Error(String(body.error ?? t('assets.uploadFailed')));
+      /* a big file goes in parts, each under what a proxy in front of Studio lets by (Cloudflare refuses a body past
+         100 MB), put together again by Studio (importPart): the person picks one file, as ever */
+      let result;
+      if (file.size <= UPLOAD_PART) {
+        // eslint-disable-next-line no-await-in-loop
+        result = await send(target, file, 0);
+      } else {
+        const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+        for (let from = 0; from < file.size; from += UPLOAD_PART) {
+          const last = from + UPLOAD_PART >= file.size;
+          // eslint-disable-next-line no-await-in-loop
+          result = await send(`${target}&upload=${id}&offset=${from}&last=${last ? 1 : 0}`, file.slice(from, from + UPLOAD_PART), from);
+          if (!result.ok) break;
+        }
+      }
+      const { ok, status, body } = result!;
+      if (!ok) throw new Error(String(body.error ?? `${t('assets.uploadFailed')}${status ? ` (HTTP ${status})` : ''}`));
       if (body.path) landed.push(body.path);
       if (body.unreadable) toast.show(t('assets.unreadable').replace('{name}', file.name).replace('{why}', body.unreadable));
       onProgress(i, 1, body.path);

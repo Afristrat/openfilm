@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, symlinkS
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
-import { FileError, bringIn, cleanName, collect, extractAudio, freezeFrame, importFile, inProject, inside, listFiles, makeFolder, moveCheck, moveFile, readable, relink, trashFile } from './files.mjs';
+import { FileError, bringIn, cleanName, collect, extractAudio, freezeFrame, importFile, importPart, inProject, inside, listFiles, makeFolder, moveCheck, moveFile, readable, relink, trashFile } from './files.mjs';
 import { lstatSync, rmSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { filmHtml, readFilmFile } from '../../src/film-doc.mjs';
@@ -367,4 +367,19 @@ test('media is dated when it came into the project: a copy now, a link when it w
   /* what a link leads to keeps its own date: its pictures are made again when it changes */
   assert.equal(of('assets/linked.mp4').mtime, new Date('2020-01-01').getTime());
   assert.equal(of('assets/here.png').added, of('assets/here.png').mtime);
+});
+
+test('a big file sent in parts (a proxy refuses big bodies) lands whole, and a part out of place is refused', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'of-parts-'));
+  try {
+    const bytes = Buffer.alloc(300_000).map((_, i) => i % 251);
+    const part = (offset, size, last) => importPart(root, 'assets/big.mp4', { id: 'essai-1234', offset, last }, Readable.from([bytes.subarray(offset, offset + size)]));
+    assert.equal(await part(0, 100_000, false), null);
+    await assert.rejects(part(250_000, 50_000, true), FileError, 'a part past what came before is refused');
+    await assert.rejects(importPart(root, 'assets/big.mp4', { id: '../x', offset: 0, last: true }, Readable.from([Buffer.from('x')])), FileError);
+    assert.equal(await part(100_000, 100_000, false), null);
+    assert.deepEqual(await part(200_000, 100_000, true), { path: 'assets/big.mp4', reused: false });
+    assert.ok(readFileSync(join(root, 'assets/big.mp4')).equals(bytes), 'the same bytes, in order');
+    assert.deepEqual(readdirSync(join(root, '.film/cache/uploads')), [], 'no part left behind');
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

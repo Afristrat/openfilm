@@ -258,6 +258,35 @@ function queuedImport(dir, job) {
   return next;
 }
 
+/** An upload sent in parts (importPart): its id, letters, digits and dashes. */
+const UPLOAD_ID = /^[a-z0-9-]{8,64}$/;
+
+/**
+ * One part of a file sent in parts: a proxy in front of Studio may refuse a body past a size (Cloudflare: 100 MB), so
+ * the page sends a big file in parts. Each part is appended to `.film/cache/uploads/<id>.part` at `offset`, which must
+ * be the bytes already there (a part sent twice, or out of order, is refused rather than written in the wrong place);
+ * the last part (`last`) imports the whole of it like any import (importFile: its name, the same file found again) and
+ * removes the parts. Returns null until the last part.
+ * @param {string} root @param {string} rel @param {{ id: string, offset: number, last: boolean }} part @param {NodeJS.ReadableStream} body
+ * @returns {Promise<{ path: string, reused: boolean } | null>}
+ */
+export async function importPart(root, rel, { id, offset, last }, body) {
+  askedInside(root, rel);
+  if (!UPLOAD_ID.test(id) || !Number.isSafeInteger(offset) || offset < 0) throw new FileError('a part of an upload without its id or its place');
+  const dir = join(root, '.film', 'cache', 'uploads');
+  await mkdir(dir, { recursive: true });
+  const tmp = join(dir, `${id}.part`);
+  const have = (await stat(tmp).catch(() => null))?.size ?? 0;
+  if (have !== offset) throw new FileError(`this part goes at byte ${offset}, but ${have} came before it: import the file again`);
+  await pipeline(body, createWriteStream(tmp, { flags: offset === 0 ? 'w' : 'a' }));
+  if (!last) return null;
+  try {
+    return await importFile(root, rel, createReadStream(tmp));
+  } finally {
+    await rm(tmp, { force: true });
+  }
+}
+
 /**
  * Write a file from a stream (an import from the person's computer). The bytes go to a temporary file first: a
  * cancelled import leaves nothing behind. The same file imported again (its name and its bytes) is the one already

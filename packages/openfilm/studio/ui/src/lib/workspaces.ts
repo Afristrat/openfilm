@@ -20,9 +20,13 @@ export const WORKSPACES_KEY = 'openfilm.workspaces.v2';
 export const LEGACY_WORKSPACES_KEY = 'openfilm.workspaces.v1';
 export const CURRENT_WORKSPACE_KEY = 'openfilm.workspace.current.v2';
 export const MAX_WORKSPACES = 24;
+/* Studio in a browser (no desktop app around it, Studio served from a server): the library has no app chat to dock in and
+   nothing but the Layout menu opens it, so the media pool, where files are imported, would stay out of sight. There it
+   is shown at the bottom from the start, as the Library layout shows it. */
+const IN_BROWSER = !(globalThis as { openfilmHost?: unknown }).openfilmHost;
 export const DEFAULT_WORKSPACE: WorkspaceLayout = {
-  mode: 'edit', tree: null, assets: false, layers: false, timeline: true, inspector: true, chat: true,
-  libraryDock: 'chat', chatSide: 'left', layersSide: 'left', inspectorSide: 'right', timelineEdge: 'bottom',
+  mode: 'edit', tree: null, assets: IN_BROWSER, layers: false, timeline: true, inspector: true, chat: true,
+  libraryDock: IN_BROWSER ? 'bottom' : 'chat', chatSide: 'left', layersSide: 'left', inspectorSide: 'right', timelineEdge: 'bottom',
   assetsWidth: 320, libraryHeight: 280, layersWidth: 240, inspectorWidth: 360, timelineHeight: null, chatWidth: 420,
 };
 export const DEFAULT_CANVAS_WORKSPACE: WorkspaceLayout = {

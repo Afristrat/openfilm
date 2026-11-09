@@ -26,7 +26,7 @@ import { EditError, editProjectFilm, pageClipLook, readProjectFilm, settleProjec
 import { compoundOuter, readPartFilm, writePartFilm } from './parts.mjs';
 import { PARTS, srcInto } from './compound.mjs';
 import { readPage, writePage } from './page-text.mjs';
-import { FileError, bringIn, collect, extractAudio, freezeFrame, importFile, inside, listFiles, makeFolder, moveCheck, moveFile, readable, relink, trashFile } from './files.mjs';
+import { FileError, bringIn, collect, extractAudio, freezeFrame, importFile, importPart, inside, listFiles, makeFolder, moveCheck, moveFile, readable, relink, trashFile } from './files.mjs';
 import { ExportError, createExports, draftApps, exportCapabilities, exportsRoot, projectSizes } from './exports.mjs';
 import { MediaError, frame, loudness, poster, probe, waveform } from './derived.mjs';
 import { HistoryError, checkoutVersion, copyVersion, deleteVersions, discardChanges, keepAside, log, recoverVersions, restoreFilm, saveVersion, status as historyStatus, versionFilesChanged } from './history.mjs';
@@ -982,7 +982,14 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
       }
       /* the body is the file itself, streamed to disk: an import of any size */
       if (req.method === 'PUT') {
-        const { path: landed } = await importFile(project.path, at, req);
+        /* a big file comes in parts (`upload`, `offset`, `last`: importPart), each under what a proxy in front lets by */
+        const upload = url.searchParams.get('upload');
+        let imported;
+        if (upload) {
+          imported = await importPart(project.path, at, { id: upload, offset: Number(url.searchParams.get('offset')), last: url.searchParams.get('last') === '1' }, req);
+          if (!imported) return json(res, 200, { received: true });
+        } else imported = await importFile(project.path, at, req);
+        const { path: landed } = imported;
         /* a picture, video or sound that cannot be read (a broken or mislabelled file) is kept, and said: it would
            only fail later, as a blank tile or a clip that never plays. Read as the kind its ending says: a picture
            or a video with no picture in it (a size of 0), a sound with no sound */
