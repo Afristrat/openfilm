@@ -79,6 +79,7 @@ import { doctor } from '../../src/doctor.mjs';
 import { recentProblems } from '../../src/problems.mjs';
 import { exportDiagnostics } from './diagnostics.mjs';
 import { agentConfig, createAgentHub, startPiSession } from './agent.mjs';
+import { LinkError, createLinkImports } from './from-url.mjs';
 
 /** @typedef {import('./http.mjs').Req} Req @typedef {import('./http.mjs').Res} Res */
 
@@ -144,6 +145,8 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   /* the agent of Studio served to a browser (agent.mjs): off, and the page says so, when this server names no model */
   let agentSettings = /** @type {ReturnType<typeof agentConfig>} */ (null);
   try { agentSettings = agentConfig(); } catch (e) { console.error(e instanceof Error ? e.message : e); }
+  /* media brought in from a link (from-url.mjs): one download at a time per project, each a job the page asks after */
+  const linkImports = createLinkImports();
   const agents = createAgentHub({
     config: agentSettings,
     start: (project, onUpdate) => startPiSession(project, onUpdate, { config: /** @type {NonNullable<typeof agentSettings>} */ (agentSettings) }),
@@ -1059,6 +1062,17 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
       return json(res, 200, await writePage(project.path, at, text, typeof expect === 'string' ? expect : null, { undo: undo === true }));
     }
     /* a clip of another project brought into this one, with the files it needs (layers pasted from there) */
+    /* a video page or a file on the web, downloaded into the project's media (from-url.mjs): started, then asked after */
+    if (rest === 'from-url' && req.method === 'POST') {
+      const { url: link, into } = /** @type {{ url?: unknown, into?: unknown }} */ (await readJson(req) ?? {});
+      const folder = typeof into === 'string' && into ? into : 'assets';
+      if (!/^assets(\/|$)/.test(folder)) throw new HttpError(400, 'Media goes into assets.');
+      inside(project.path, folder);
+      return json(res, 202, { job: await linkImports.start(project.path, link, folder) });
+    }
+    if (rest === 'from-url' && req.method === 'GET') {
+      return json(res, 200, { job: linkImports.get(project.path, url.searchParams.get('job') ?? '') });
+    }
     if (rest === 'bring' && req.method === 'POST') {
       const { from, clip } = /** @type {{ from?: unknown, clip?: any }} */ (await readJson(req) ?? {});
       const source = typeof from === 'string' ? await projectById(from).catch(() => null) : null;
@@ -1211,7 +1225,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
     if (!ownHost(req, /** @type {import('node:net').AddressInfo} */ (editor.address()).port, published?.editorHost)) { json(res, 403, { error: 'not this address' }); return; }
     route(req, res).catch((/** @type {unknown} */ e) => {
       const status = e instanceof HttpError || e instanceof ProjectError || e instanceof FileError || e instanceof HistoryError || e instanceof MediaError || e instanceof ExportError
-        || e instanceof FetchError || e instanceof BrowseError ? e.status : 500;
+        || e instanceof FetchError || e instanceof BrowseError || e instanceof LinkError ? e.status : 500;
       if (status === 500) console.error(e);
       if (res.headersSent) return res.end();
       json(res, status, { error: e instanceof Error ? e.message : String(e), ...(e instanceof HttpError ? e.extra : {}),

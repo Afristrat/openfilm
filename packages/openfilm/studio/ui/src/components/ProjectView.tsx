@@ -2754,6 +2754,7 @@ export function ProjectView({ projectId, onProject, onLeave }: {
       selectedPath={pickedSaved ? null : pickedMedia?.path ?? null}
       onSelectFile={pickMedia}
       onImport={onImport}
+      onFromUrl={onFromUrl}
       onMove={onMove}
       onMoveCheck={onMoveCheck}
       onDelete={onDelete}
@@ -3676,6 +3677,26 @@ export function ProjectView({ projectId, onProject, onLeave }: {
    * Each file's progress is its bytes sent (XMLHttpRequest: fetch cannot tell how much of a body has gone), then 1 and
    * where it landed
    */
+  /* a link downloaded into the project on the server (from-url.mjs): started, then asked after until it lands */
+  const onFromUrl = React.useCallback(async (link: string, into: string, onProgress: (ratio: number) => void): Promise<string> => {
+    const started = await fetch(`${projectApi}/from-url`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ url: link, into }) });
+    const first = await started.json().catch(() => ({})) as { job?: { id: string; status: string; ratio: number; path?: string; error?: string }; error?: string };
+    if (!started.ok || !first.job) throw new Error(first.error || t('media.linkFailed'));
+    let job = first.job;
+    while (job.status === 'running') {
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((done) => setTimeout(done, 1500));
+      // eslint-disable-next-line no-await-in-loop
+      const asked = await fetch(`${projectApi}/from-url?job=${encodeURIComponent(job.id)}`, { cache: 'no-store' });
+      // eslint-disable-next-line no-await-in-loop
+      const body = await asked.json().catch(() => ({})) as { job?: typeof job; error?: string };
+      if (!asked.ok || !body.job) throw new Error(body.error || t('media.linkFailed'));
+      job = body.job;
+      onProgress(job.ratio ?? 0);
+    }
+    if (job.status !== 'done' || !job.path) throw new Error(job.error || t('media.linkFailed'));
+    return job.path;
+  }, [projectApi, t]);
   const onImport = React.useCallback(async (files: File[], into: string, onProgress: ImportProgress): Promise<string[]> => {
     const landed: string[] = [];
     /* in the app a dropped file's path is known: copied on this computer (cloned where the disk can: at once, and no

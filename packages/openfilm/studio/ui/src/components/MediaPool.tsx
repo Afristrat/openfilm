@@ -166,6 +166,11 @@ export interface MediaPoolProps {
    */
   onPick?: (title: string, folder: boolean) => Promise<string[] | 'no-dialog'>;
   onBring?: (paths: string[], folder: string, mode: 'copy' | 'link') => Promise<string[]>;
+  /**
+   * A video page or a file on the web downloaded into `folder` (Studio served to a browser: from-url.mjs), its progress
+   * told as it comes; resolves with where it landed. Without it, Upload offers files only.
+   */
+  onFromUrl?: (link: string, folder: string, onProgress: (ratio: number) => void) => Promise<string>;
   /** A link pointed at where its media is now (the person picks it), or copied into the project in its place. */
   onRelink?: (path: string, folder: boolean) => Promise<MediaResult>;
   onCollect?: (path: string) => Promise<MediaResult>;
@@ -215,6 +220,7 @@ export function MediaPool({
   onReveal,
   onPick,
   onBring,
+  onFromUrl,
   onRelink,
   onCollect,
   onSave,
@@ -340,6 +346,27 @@ export function MediaPool({
   /** The folder an item is in ('' the top, where the pages are shown). */
   const hereOf = (key: string) => (key.startsWith(`${root}/`) ? relDir(assetRel(key)) : '');
 
+  /* a link being written (Upload → Import from a link), and the download it starts: a card while it comes, as a file's */
+  const [linking, setLinking] = React.useState(false);
+  const [link, setLink] = React.useState('');
+  const fromLink = async (intoRel = at) => {
+    const text = link.trim();
+    if (!text || !onFromUrl) return;
+    setLinking(false);
+    setLink('');
+    setNotice(null);
+    const id = `upload-${++uploadSeq}`;
+    let name = text;
+    try { name = new URL(text).hostname; } catch { /* the server says what is wrong with it */ }
+    setUploads((all) => [...all, { id, name, into: intoRel, kind: 'video', ratio: 0 }]);
+    try {
+      const landed = await onFromUrl(text, folderPath(intoRel), (ratio) => setUploads((all) => all.map((u) => (u.id === id ? { ...u, ratio } : u))));
+      setUploads((all) => all.map((u) => (u.id === id ? { ...u, ratio: 1, landed } : u)));
+    } catch (e) {
+      setNotice(e instanceof Error && e.message ? e.message : t('media.linkFailed'));
+      dropUploads((u) => u.id === id);
+    }
+  };
   const importFiles = async (list: File[], intoRel = at) => {
     if (!list.length) return;
     setNotice(null);
@@ -616,6 +643,11 @@ export function MediaPool({
     { id: 'link', label: t('media.linkFiles'), note: t('media.linkFilesNote'), icon: <Link2 size={14} />, onSelect: () => { void bringFrom('link', false); } },
     { id: 'link-folder', label: t('media.linkFolder'), icon: <FolderSymlink size={14} />, onSelect: () => { void bringFrom('link', true); } },
   ];
+  /* in a browser: files picked there, or a link downloaded on the server */
+  const browserImportMenu: ContextMenuEntry[] = [
+    { id: 'import', label: t('media.importFiles'), note: t('media.importFilesNote'), icon: <Upload size={14} />, onSelect: () => inputRef.current?.click() },
+    { id: 'from-url', label: t('media.importLink'), note: t('media.importLinkNote'), icon: <Link2 size={14} />, onSelect: () => setLinking(true) },
+  ];
   const blankMenu: ContextMenuEntry[] = [
     { id: 'new-folder', label: t('assets.newFolder'), icon: <FolderPlus size={14} />, onSelect: () => setCreating(true) },
     { id: 'import', label: t('media.import'), icon: <Plus size={14} />, onSelect: () => (onPick && onBring ? void bringFrom('copy', false) : inputRef.current?.click()) },
@@ -873,7 +905,7 @@ export function MediaPool({
         {/* bringing media in is what this pane is for: the one labeled button, right after the search */}
         <Tooltip label={t('media.import')} side="bottom">
           <button type="button" aria-label={t('media.import')} aria-haspopup={onPick && onBring ? 'menu' : undefined}
-            onClick={(e) => (onPick && onBring ? (links ? barMenu(e, importMenu) : void bringFrom('copy', false)) : inputRef.current?.click())}
+            onClick={(e) => (onPick && onBring ? (links ? barMenu(e, importMenu) : void bringFrom('copy', false)) : onFromUrl ? barMenu(e, browserImportMenu) : inputRef.current?.click())}
             className={`flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md bg-[var(--bg-pressed)] text-[12.5px] font-medium text-[var(--text)] transition hover:bg-[var(--border-strong)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--border-strong)] ${bar.uploadWord ? 'px-2.5' : 'w-7'}`}>
             <Upload size={13} strokeWidth={2.2} />
             {bar.uploadWord ? uploadWord : null}
@@ -899,6 +931,15 @@ export function MediaPool({
         <input ref={inputRef} type="file" multiple className="hidden"
           onChange={(e) => { const list = [...(e.target.files ?? [])]; e.target.value = ''; void importFiles(list); }} />
       </div>
+      {linking ? (
+        <form className="flex shrink-0 items-center gap-1.5 px-2.5 pb-2" onSubmit={(e) => { e.preventDefault(); void fromLink(); }}>
+          <input autoFocus type="url" required value={link} onChange={(e) => setLink(e.target.value)} placeholder={t('media.linkPlaceholder')}
+            aria-label={t('media.importLink')} onKeyDown={(e) => { if (e.key === 'Escape') { setLinking(false); setLink(''); } }}
+            className="h-7 min-w-0 flex-1 rounded-md bg-[var(--bg-hover)] px-2 text-[12.5px] text-[var(--text)] outline-none placeholder:text-[var(--text-muted)]" />
+          <button type="submit" className="h-7 shrink-0 rounded-md bg-[var(--bg-pressed)] px-2.5 text-[12.5px] font-medium text-[var(--text)] hover:bg-[var(--border-strong)]">{t('media.linkGo')}</button>
+          <button type="button" onClick={() => { setLinking(false); setLink(''); }} className="h-7 shrink-0 rounded-md px-2 text-[12.5px] text-[var(--text-muted)] hover:text-[var(--text)]">{t('media.linkCancel')}</button>
+        </form>
+      ) : null}
 
       {/* where you are: All, then the folders you went into (drop a file on one to move it there) */}
       <div className="flex h-7 shrink-0 items-center gap-0.5 overflow-hidden px-2.5 text-[12.5px]">
