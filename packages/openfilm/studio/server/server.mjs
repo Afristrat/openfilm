@@ -149,7 +149,7 @@ export async function startStudio({ port = 4747, key, openBrowser = systemBrowse
   const linkImports = createLinkImports();
   const agents = createAgentHub({
     config: agentSettings,
-    start: (project, onUpdate) => startPiSession(project, onUpdate, { config: /** @type {NonNullable<typeof agentSettings>} */ (agentSettings) }),
+    start: (project, onUpdate, asks) => startPiSession(project, onUpdate, asks, { config: /** @type {NonNullable<typeof agentSettings>} */ (agentSettings) }),
   });
   /** whether an app's agent, or the browser's, is working in the project at `path` now */
   const agentIn = (/** @type {string} */ path) => [...working(), ...agents.working()].some((folder) => resolve(folder) === resolve(path));

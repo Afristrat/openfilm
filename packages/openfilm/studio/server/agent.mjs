@@ -14,9 +14,10 @@
  *
  * One agent per project, whichever pages are open on it: each page sees every turn (the person's words, the agent's
  * as they come, its tools), one turn at a time. Pages talk to it on a WebSocket (/api/projects/:id/agent):
- *   in:  {type: 'prompt', text} · {type: 'cancel'}
+ *   in:  {type: 'prompt', text} · {type: 'cancel'} · {type: 'answer', requestId, answers | optionId}
  *   out: {kind: 'ready', available, busy, model} · {kind: 'turn', text} · {kind: 'update', update} (ACP session/update)
  *        · {kind: 'busy'} · {kind: 'done', stopReason} · {kind: 'error', message}
+ *        · {kind: 'question' | 'permission', requestId, …} what the agent asks the person · {kind: 'answered', requestId, by}
  *        · {kind: 'history', entries} right after `ready`: the conversation so far, for a page opened (again) on it
  * A project's conversation is taken up again when its agent starts anew (<project>/.film/agent/web.json keeps which),
  * and what was said is kept for the pages in <project>/.film/agent/web-log.json (the last MAX_ENTRIES entries).
@@ -101,14 +102,42 @@ export function harnessOf(config, key, home) {
   };
 }
 
+/** How long the agent waits for the person to answer one of its questions or permissions before it decides itself. */
+export const ASK_MS = 10 * 60_000;
+
 /**
- * What a page said, or null for anything else: a message (its words, trimmed, at most MAX_PROMPT) or a stop.
- * @param {string} text @returns {{ type: 'prompt', text: string } | { type: 'cancel' } | null}
+ * The answers a page gave to a question, kept to what agents.mjs formContent reads: per question id, a choice
+ * (`label`) or the person's own words (`text`), each at most 2 000 characters; null when it is not that.
+ * @param {unknown} answers @returns {Record<string, { label?: string, text?: string }> | null}
+ */
+export function readAnswers(answers) {
+  if (!answers || typeof answers !== 'object' || Array.isArray(answers)) return null;
+  /** @type {Record<string, { label?: string, text?: string }>} */
+  const out = {};
+  for (const [id, a] of Object.entries(answers).slice(0, 10)) {
+    if (!a || typeof a !== 'object') continue;
+    const label = /** @type {any} */ (a).label, text = /** @type {any} */ (a).text;
+    if (typeof label === 'string' && label.length <= 2000) out[id] = { label };
+    else if (typeof text === 'string' && text.trim() && text.length <= 2000) out[id] = { text: text.trim() };
+  }
+  return out;
+}
+
+/**
+ * What a page said, or null for anything else: a message (its words, trimmed, at most MAX_PROMPT), a stop, or its
+ * reply to something the agent asked (`answer`: a question's answers or a permission's option; null for « skip »).
+ * @param {string} text
+ * @returns {{ type: 'prompt', text: string } | { type: 'cancel' } | { type: 'answer', requestId: string, answers?: Record<string, { label?: string, text?: string }> | null, optionId?: string | null } | null}
  */
 export function readSaid(text) {
   let said;
   try { said = JSON.parse(text); } catch { return null; }
   if (said?.type === 'cancel') return { type: 'cancel' };
+  if (said?.type === 'answer') {
+    if (typeof said.requestId !== 'string' || !said.requestId || said.requestId.length > 100) return null;
+    if ('optionId' in said) return { type: 'answer', requestId: said.requestId, optionId: typeof said.optionId === 'string' && said.optionId.length <= 200 ? said.optionId : null };
+    return { type: 'answer', requestId: said.requestId, answers: said.answers == null ? null : readAnswers(said.answers) };
+  }
   if (said?.type !== 'prompt' || typeof said.text !== 'string') return null;
   const words = said.text.trim();
   return words && words.length <= MAX_PROMPT ? { type: 'prompt', text: words } : null;
@@ -116,8 +145,27 @@ export function readSaid(text) {
 
 /**
  * @typedef {{ kind: 'turn', text: string } | { kind: 'reply', text: string } | { kind: 'tool', id: string, title: string, status: string }
- *   | { kind: 'error', message: string } | { kind: 'stopped' }} Entry
+ *   | { kind: 'error', message: string } | { kind: 'stopped' } | { kind: 'asked', text: string, answer: string }} Entry
  */
+
+/** A question or a permission as the conversation keeps it: what was asked, in words. */
+export function askedText(/** @type {any} */ event) {
+  if (event?.kind === 'question') return [event.message, ...(event.questions ?? []).map((q) => q.question)].filter((t, i, all) => t && all.indexOf(t) === i).join('\n');
+  return `Autorisation : ${event?.params?.toolCall?.title ?? 'une action'}`;
+}
+
+/** The person's reply as the conversation keeps it. */
+export function answerText(/** @type {any} */ event, /** @type {any} */ reply) {
+  if (reply?.by === 'timeout') return 'Sans réponse : l’agent a décidé lui-même.';
+  if (reply?.by === 'cancelled' || reply?.by === 'ended') return 'Tour arrêté avant la réponse.';
+  if (event?.kind === 'permission') {
+    const option = (event.params?.options ?? []).find((o) => o.optionId === reply?.optionId);
+    return option ? String(option.name ?? option.optionId) : 'Refusé.';
+  }
+  const answers = reply?.answers;
+  if (!answers) return 'Passé : l’agent décide lui-même.';
+  return Object.values(answers).map((a) => /** @type {any} */ (a).label ?? /** @type {any} */ (a).text).filter(Boolean).join(' · ') || 'Passé : l’agent décide lui-même.';
+}
 
 /**
  * The conversation as a page shows it, one event more: the person's words, the agent's words (its pieces joined),
@@ -129,6 +177,7 @@ export function noteEvent(entries, event) {
   if (event?.kind === 'turn') entries.push({ kind: 'turn', text: String(event.text) });
   else if (event?.kind === 'error') entries.push({ kind: 'error', message: String(event.message) });
   else if (event?.kind === 'done' && event.stopReason === 'cancelled') entries.push({ kind: 'stopped' });
+  else if (event?.kind === 'answered' && event.asked) entries.push({ kind: 'asked', text: askedText(event.asked), answer: answerText(event.asked, event) });
   else if (event?.kind === 'update') {
     const u = event.update ?? {};
     if (u.sessionUpdate === 'agent_message_chunk' && u.content?.type === 'text') {
@@ -160,22 +209,47 @@ export const projectLog = {
 
 /**
  * @typedef {{ prompt: (text: string) => Promise<unknown>, cancel: () => Promise<unknown> | void, close: () => void }} Started
- * @typedef {(project: { path: string }, onUpdate: (update: unknown) => void) => Promise<Started>} Start
+ * @typedef {{ question: (ask: { message: string, toolCallId: string | null, questions: any[] }) => Promise<Record<string, { label?: string, text?: string }> | null>,
+ *   permission: (params: any) => Promise<string | null> }} Asks
+ * @typedef {(project: { path: string }, onUpdate: (update: unknown) => void, asks: Asks) => Promise<Started>} Start
  */
 
 /**
  * The agents of every project, each started on its first message (`start`), and the pages open on them.
  * `log`: where each project's conversation is kept for its pages (projectLog: in the project).
- * @param {{ config: ReturnType<typeof agentConfig>, start: Start, idleMs?: number, log?: typeof projectLog }} options
+ * What the agent asks the person (a question, a permission) goes to every page, `{kind: 'question', requestId,
+ * message, questions}` or `{kind: 'permission', requestId, params}`, again to a page opened while it waits; the first
+ * page to answer (`{type: 'answer', requestId, answers | optionId}`) settles it, and every page hears
+ * `{kind: 'answered', requestId, by}`. Unanswered after `askMs`, or the turn stopped, the agent decides itself (a
+ * question skipped, a permission refused).
+ * @param {{ config: ReturnType<typeof agentConfig>, start: Start, idleMs?: number, askMs?: number, log?: typeof projectLog }} options
  */
-export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectLog }) {
-  /** @type {Map<string, { pages: Set<(event: unknown) => void>, session: Promise<Started> | null, busy: boolean, idle: ReturnType<typeof setTimeout> | null, entries: Entry[] }>} */
+export function createAgentHub({ config, start, idleMs = IDLE_MS, askMs = ASK_MS, log = projectLog }) {
+  /** @typedef {{ event: any, settle: (reply: any) => void, timer: ReturnType<typeof setTimeout> }} Asking */
+  /** @type {Map<string, { pages: Set<(event: unknown) => void>, session: Promise<Started> | null, busy: boolean, idle: ReturnType<typeof setTimeout> | null, entries: Entry[], asking: Map<string, Asking> }>} */
   const rooms = new Map();
   const roomOf = (/** @type {string} */ path) => {
     let room = rooms.get(path);
-    if (!room) rooms.set(path, (room = { pages: new Set(), session: null, busy: false, idle: null, entries: log.load(path) }));
+    if (!room) rooms.set(path, (room = { pages: new Set(), session: null, busy: false, idle: null, entries: log.load(path), asking: new Map() }));
     return room;
   };
+  /* one thing asked of the person: on every page until one answers, the time runs out or the turn stops */
+  const ask = (/** @type {ReturnType<typeof roomOf>} */ room, /** @type {any} */ event) => new Promise((resolve) => {
+    const requestId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+    const asked = { ...event, requestId };
+    const settle = (/** @type {any} */ reply) => {
+      const pending = room.asking.get(requestId);
+      if (!pending) return;
+      clearTimeout(pending.timer);
+      room.asking.delete(requestId);
+      tell(room, { kind: 'answered', requestId, by: reply.by, asked, ...(reply.answers !== undefined ? { answers: reply.answers } : {}), ...(reply.optionId !== undefined ? { optionId: reply.optionId } : {}) });
+      resolve(event.kind === 'question' ? reply.answers ?? null : reply.optionId ?? null);
+    };
+    const timer = setTimeout(() => settle({ by: 'timeout' }), askMs);
+    timer.unref?.();
+    room.asking.set(requestId, { event: asked, settle, timer });
+    tell(room, asked);
+  });
   const tell = (/** @type {{ pages: Set<(event: unknown) => void>, entries: Entry[] }} */ room, /** @type {unknown} */ event) => {
     noteEvent(room.entries, event);
     for (const send of room.pages) send(event);
@@ -198,13 +272,17 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectL
     room.busy = true;
     tell(room, { kind: 'turn', text });
     try {
-      room.session ??= start(project, (update) => tell(room, { kind: 'update', update }));
+      room.session ??= start(project, (update) => tell(room, { kind: 'update', update }), {
+        question: (asked) => ask(room, { kind: 'question', message: String(asked?.message ?? ''), toolCallId: asked?.toolCallId ?? null, questions: asked?.questions ?? [] }),
+        permission: (params) => ask(room, { kind: 'permission', params }),
+      });
       const session = await room.session.catch((e) => { room.session = null; throw e; });
       const stopReason = await session.prompt(text);
       tell(room, { kind: 'done', stopReason: stopReason ?? null });
     } catch (e) {
       tell(room, { kind: 'error', message: e instanceof Error ? e.message : String(e) });
     } finally {
+      for (const pending of [...room.asking.values()]) pending.settle({ by: 'ended' });
       room.busy = false;
       try { log.save(project.path, room.entries); } catch (e) { console.error(`agent: the conversation of ${project.path} was not kept: ${e instanceof Error ? e.message : e}`); }
       rest(project.path);
@@ -224,11 +302,24 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectL
       room.pages.add(send);
       send({ kind: 'ready', available: Boolean(config), busy: room.busy, model: config?.name ?? null });
       if (room.entries.length) send({ kind: 'history', entries: room.entries });
+      for (const pending of room.asking.values()) send(pending.event);
       return {
         said(/** @type {string} */ text) {
           const said = readSaid(text);
           if (!said) return;
-          if (said.type === 'cancel') { void room.session?.then((s) => s.cancel(), () => {}); return; }
+          if (said.type === 'answer') {
+            const pending = room.asking.get(said.requestId);
+            if (!pending) return;
+            const permission = pending.event.kind === 'permission';
+            if (permission && said.optionId && !(pending.event.params?.options ?? []).some((/** @type {any} */ o) => o.optionId === said.optionId)) return;
+            pending.settle(permission ? { by: 'page', optionId: said.optionId ?? null } : { by: 'page', answers: said.answers ?? null });
+            return;
+          }
+          if (said.type === 'cancel') {
+            for (const pending of [...room.asking.values()]) pending.settle({ by: 'cancelled' });
+            void room.session?.then((s) => s.cancel(), () => {});
+            return;
+          }
           if (!config) { send({ kind: 'error', message: 'Aucun modèle n’est configuré pour l’agent sur ce serveur.' }); return; }
           if (room.busy) { send({ kind: 'busy' }); return; }
           void turn(room, project, said.text);
@@ -243,6 +334,7 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectL
     closeAll() {
       for (const room of rooms.values()) {
         if (room.idle) clearTimeout(room.idle);
+        for (const pending of [...room.asking.values()]) pending.settle({ by: 'ended' });
         void room.session?.then((s) => s.close(), () => {});
       }
       rooms.clear();
@@ -253,12 +345,13 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectL
 /**
  * A project's agent started: Pi through the desktop's AgentSession, in the project's folder, the `openfilm` command
  * (written under <home>/agent/bin) first on its PATH, OpenFilm's skills, its conversation taken up again when the
- * project had one. With a looking model (config.look), `regarder` beside it and LOOK_NOTE before its first words. Every permission it asks is refused and every question declined: the page has no place for them yet.
- * @param {{ path: string }} project @param {(update: unknown) => void} onUpdate
+ * project had one. With a looking model (config.look), `regarder` beside it and LOOK_NOTE before its first words. What
+ * it asks the person (its `ask` questions, a permission) goes to the pages through `asks` (createAgentHub).
+ * @param {{ path: string }} project @param {(update: unknown) => void} onUpdate @param {Asks} asks
  * @param {{ config: NonNullable<ReturnType<typeof agentConfig>>, home?: string }} options
  * @returns {Promise<Started>}
  */
-export async function startPiSession(project, onUpdate, { config, home = studioHome() }) {
+export async function startPiSession(project, onUpdate, asks, { config, home = studioHome() }) {
   const key = readFileSync(config.keyFile, 'utf8').trim();
   if (!key) throw new Error(`No key in ${config.keyFile}.`);
   const { AgentSession } = await import(new URL('agents.mjs', DESKTOP).href);
@@ -283,8 +376,8 @@ export async function startPiSession(project, onUpdate, { config, home = studioH
     harness: harnessOf(config, key, home),
     skills: { dataDir, mine: mySkillsDir(), prefsHome: home },
     onUpdate,
-    onPermission: async () => null,
-    onQuestion: async () => null,
+    onPermission: (params) => asks.permission(params),
+    onQuestion: (asked) => asks.question(asked),
   });
   const info = await session.start();
   mkdirSync(dirname(kept), { recursive: true });

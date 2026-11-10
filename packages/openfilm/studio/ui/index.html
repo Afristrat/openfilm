@@ -112,7 +112,7 @@
   }
 
   /* the conversation with the project's agent (studio/server/agent.mjs): one socket per project open */
-  var agent = { project: null, ws: null, ready: false, available: false, busy: false, model: null, reply: null, tools: {}, retry: 0, timer: null };
+  var agent = { project: null, ws: null, ready: false, available: false, busy: false, model: null, reply: null, tools: {}, asks: {}, retry: 0, timer: null };
   function projectFromAddress() {
     var m = /^\/projects\/([\w-]+)/.exec(location.pathname);
     return m ? m[1] : null;
@@ -168,8 +168,88 @@
       return all;
     });
   }
+  /* what the agent asks the person (a question, a permission): a card with its choices; the first page to answer settles it */
+  var BUTTON = 'border-radius:6px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:3px 9px;font:inherit;font-size:12px;cursor:pointer';
+  function asked(event) {
+    if (agent.asks[event.requestId]) return;
+    var card = make('div', 'border:1px solid var(--accent,#3b82f6);border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px;background:var(--panel,#1f1f1f)');
+    card.setAttribute('role', 'group');
+    card.setAttribute('aria-label', event.kind === 'permission' ? 'Autorisation demandée par l’agent' : 'Question de l’agent');
+    var answer = function (message) { message.type = 'answer'; message.requestId = event.requestId; say(message); };
+    if (event.kind === 'permission') {
+      var p = event.params || {};
+      card.appendChild(make('div', 'font-weight:600', 'L’agent demande votre accord'));
+      card.appendChild(make('div', 'white-space:pre-wrap;word-break:break-word', (p.toolCall && p.toolCall.title) || 'une action'));
+      var row = make('div', 'display:flex;flex-wrap:wrap;gap:6px');
+      (p.options || []).forEach(function (o) {
+        var b = make('button', BUTTON, o.name || o.optionId);
+        b.type = 'button';
+        b.addEventListener('click', function () { answer({ optionId: o.optionId }); });
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    } else {
+      var chosen = {};
+      card.appendChild(make('div', 'font-weight:600', 'L’agent vous demande'));
+      (event.questions || []).forEach(function (q) {
+        card.appendChild(make('div', 'white-space:pre-wrap;word-break:break-word', (q.header ? q.header + ' : ' : '') + q.question));
+        var row = make('div', 'display:flex;flex-wrap:wrap;gap:6px');
+        (q.options || []).forEach(function (o) {
+          var b = make('button', BUTTON, o.label);
+          b.type = 'button';
+          if (o.description) b.title = o.description;
+          b.addEventListener('click', function () {
+            chosen[q.id] = { label: o.label };
+            Array.prototype.forEach.call(row.children, function (x) { x.style.background = 'transparent'; x.setAttribute('aria-pressed', 'false'); });
+            b.style.background = 'var(--accent,#3b82f6)'; b.setAttribute('aria-pressed', 'true');
+            if ((event.questions || []).length === 1) answer({ answers: chosen });
+          });
+          row.appendChild(b);
+        });
+        card.appendChild(row);
+        var own = make('input', 'box-sizing:border-box;width:100%;border-radius:6px;border:1px solid var(--border,#333);background:transparent;color:inherit;padding:4px 6px;font:inherit;font-size:12px');
+        own.placeholder = 'Ou répondez avec vos mots';
+        own.setAttribute('aria-label', 'Votre réponse : ' + q.question);
+        own.addEventListener('input', function () { if (own.value.trim()) chosen[q.id] = { text: own.value }; else if (chosen[q.id] && chosen[q.id].text != null) delete chosen[q.id]; });
+        own.addEventListener('keydown', function (e) { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); answer({ answers: chosen }); } });
+        card.appendChild(own);
+      });
+      var actions = make('div', 'display:flex;gap:6px;justify-content:flex-end');
+      var skip = make('button', BUTTON, 'Passer (l’agent décide)');
+      skip.type = 'button';
+      skip.addEventListener('click', function () { answer({ answers: null }); });
+      var go = make('button', BUTTON.replace('background:transparent', 'background:var(--accent,#3b82f6)').replace('color:inherit', 'color:#fff'), 'Répondre');
+      go.type = 'button';
+      go.addEventListener('click', function () { answer({ answers: chosen }); });
+      actions.appendChild(skip);
+      actions.appendChild(go);
+      card.appendChild(actions);
+    }
+    agent.asks[event.requestId] = card;
+    agent.reply = null;
+    ui.log.appendChild(card);
+    ui.log.scrollTop = ui.log.scrollHeight;
+  }
+  function answeredLine(question, answerText) {
+    bubble('agent', '❓ ' + question + '\n→ ' + answerText);
+  }
   function heard(event) {
-    if (event.kind === 'ready') { agent.ready = true; agent.available = event.available; agent.busy = event.busy; agent.model = event.model; agent.retry = 0; }
+    if (event.kind === 'question' || event.kind === 'permission') asked(event);
+    else if (event.kind === 'answered') {
+      var card = agent.asks[event.requestId];
+      if (card) { card.remove(); delete agent.asks[event.requestId]; }
+      var a = event.asked || {};
+      var q = a.kind === 'permission' ? 'Autorisation : ' + ((a.params && a.params.toolCall && a.params.toolCall.title) || 'une action')
+        : [a.message].concat((a.questions || []).map(function (x) { return x.question; })).filter(function (t, i, all) { return t && all.indexOf(t) === i; }).join('\n');
+      var opt = a.kind === 'permission' ? ((a.params && a.params.options) || []).filter(function (o) { return o.optionId === event.optionId; })[0] : null;
+      var said = event.by === 'timeout' ? 'Sans réponse : l’agent a décidé lui-même.'
+        : event.by === 'cancelled' || event.by === 'ended' ? 'Tour arrêté avant la réponse.'
+        : a.kind === 'permission' ? (opt ? (opt.name || opt.optionId) : 'Refusé.')
+        : event.answers ? Object.keys(event.answers).map(function (k) { return event.answers[k].label || event.answers[k].text; }).join(' · ') || 'Passé : l’agent décide lui-même.'
+        : 'Passé : l’agent décide lui-même.';
+      answeredLine(q, said);
+    }
+    else if (event.kind === 'ready') { agent.ready = true; agent.available = event.available; agent.busy = event.busy; agent.model = event.model; agent.retry = 0; }
     else if (event.kind === 'turn') { agent.busy = true; agent.reply = null; agent.tools = {}; bubble('person', event.text); }
     else if (event.kind === 'history') {
       /* the conversation so far (the server keeps it with the project): a page opened again shows it */
@@ -179,6 +259,7 @@
         else if (e.kind === 'tool') agent.tools[e.id] = { node: toolLine(e.title, e.status), title: e.title };
         else if (e.kind === 'error') bubble('error', e.message);
         else if (e.kind === 'stopped') bubble('error', 'Tour arrêté.');
+        else if (e.kind === 'asked') answeredLine(e.text, e.answer);
       });
     }
     else if (event.kind === 'busy') bubble('error', 'L’agent travaille déjà : attendez la fin de son tour, ou arrêtez-le.');
@@ -214,7 +295,7 @@
   function connect() {
     if (agent.timer) { clearTimeout(agent.timer); agent.timer = null; }
     if (agent.ws) { agent.ws.onclose = null; agent.ws.close(); agent.ws = null; }
-    agent.ready = false; agent.busy = false; agent.reply = null; agent.tools = {};
+    agent.ready = false; agent.busy = false; agent.reply = null; agent.tools = {}; agent.asks = {};
     if (ui.log) ui.log.textContent = '';
     refresh();
     if (!agent.project) return;

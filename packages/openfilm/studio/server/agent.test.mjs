@@ -164,3 +164,70 @@ test('regarder is written beside openfilm: this Node running look.mjs, with what
   assert.match(script, /exec '\/opt\/no'\\''de' '[^']*look\.mjs' "\$@"\n$/);
   assert.equal(statSync(file).mode & 0o111, 0o111, 'executable');
 });
+
+test('a page answers what the agent asks: its question on every page (and one opened meanwhile), settled once, kept in the conversation', async () => {
+  /** @type {any} */
+  let asks = null;
+  /** @type {(v: string) => void} */
+  let finish = () => {};
+  const kept = memoryLog();
+  const hub = createAgentHub({
+    config: CONFIG,
+    log: kept,
+    start: async (_project, _onUpdate, given) => { asks = given; return { prompt: () => new Promise((done) => { finish = done; }), cancel: () => {}, close: () => {} }; },
+  });
+  const project = { path: '/films/ask' };
+  const a = [], b = [];
+  const pa = hub.join(project, (e) => a.push(e));
+  pa.said('{"type":"prompt","text":"monte le clip"}');
+  await tick();
+  const answer = asks.question({ message: 'Quelle durée ?', toolCallId: 't1', questions: [{ id: 'q0', question: 'Quelle durée ?', options: [{ label: '1 min' }, { label: '3 min' }] }] });
+  const asked = a.find((e) => e.kind === 'question');
+  assert.ok(asked?.requestId, 'the page is asked');
+  const pb = hub.join(project, (e) => b.push(e));
+  assert.equal(b.find((e) => e.kind === 'question')?.requestId, asked.requestId, 'a page opened meanwhile is asked too');
+  pb.said(JSON.stringify({ type: 'answer', requestId: asked.requestId, answers: { q0: { label: '3 min' } } }));
+  assert.deepEqual(await answer, { q0: { label: '3 min' } });
+  pa.said(JSON.stringify({ type: 'answer', requestId: asked.requestId, answers: { q0: { label: '1 min' } } }));
+  assert.equal(a.filter((e) => e.kind === 'answered').length, 1, 'answered once: a late answer changes nothing');
+  finish('end_turn');
+  await tick();
+  assert.deepEqual(kept.kept.get('/films/ask').find((e) => e.kind === 'asked'), { kind: 'asked', text: 'Quelle durée ?', answer: '3 min' });
+  hub.closeAll();
+});
+
+test('a permission takes only one of its own options; unanswered in time the agent decides itself, and a stop settles what it asked', async () => {
+  /** @type {any} */
+  let asks = null;
+  const hub = createAgentHub({
+    config: CONFIG,
+    log: memoryLog(),
+    askMs: 30,
+    start: async (_project, _onUpdate, given) => { asks = given; return { prompt: () => new Promise(() => {}), cancel: () => {}, close: () => {} }; },
+  });
+  const seen = [];
+  const page = hub.join({ path: '/films/perm' }, (e) => seen.push(e));
+  page.said('{"type":"prompt","text":"rendu"}');
+  await tick();
+  const allowed = asks.permission({ toolCall: { title: 'rm -rf' }, options: [{ optionId: 'ok', name: 'Autoriser', kind: 'allow_once' }, { optionId: 'no', name: 'Refuser', kind: 'reject_once' }] });
+  const id = seen.find((e) => e.kind === 'permission').requestId;
+  page.said(JSON.stringify({ type: 'answer', requestId: id, optionId: 'invented' }));
+  page.said(JSON.stringify({ type: 'answer', requestId: id, optionId: 'ok' }));
+  assert.equal(await allowed, 'ok');
+  const awake = setTimeout(() => {}, 1000); /* the wait's own timer does not keep the process up */
+  assert.equal(await asks.question({ message: 'x', toolCallId: null, questions: [] }), null, 'nobody answered in time');
+  clearTimeout(awake);
+  assert.equal(seen.filter((e) => e.kind === 'answered').at(-1).by, 'timeout');
+  const stopped = asks.permission({ options: [] });
+  page.said('{"type":"cancel"}');
+  assert.equal(await stopped, null);
+  hub.closeAll();
+});
+
+test('a page may answer what was asked, by its id, with choices or its own words only', () => {
+  assert.deepEqual(readSaid('{"type":"answer","requestId":"r1","answers":{"q0":{"label":"3 min"},"q1":{"text":"  libre "},"q2":{"x":1}}}'),
+    { type: 'answer', requestId: 'r1', answers: { q0: { label: '3 min' }, q1: { text: 'libre' } } });
+  assert.deepEqual(readSaid('{"type":"answer","requestId":"r1","answers":null}'), { type: 'answer', requestId: 'r1', answers: null });
+  assert.deepEqual(readSaid('{"type":"answer","requestId":"r1","optionId":"ok"}'), { type: 'answer', requestId: 'r1', optionId: 'ok' });
+  assert.equal(readSaid('{"type":"answer","answers":{}}'), null);
+});
