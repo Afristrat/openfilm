@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { MAX_ENTRIES, MAX_PROMPT, agentConfig, createAgentHub, harnessOf, noteEvent, readSaid } from './agent.mjs';
+import { mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { MAX_ENTRIES, MAX_PROMPT, agentConfig, createAgentHub, harnessOf, installLook, noteEvent, readSaid } from './agent.mjs';
 
-const CONFIG = { baseUrl: 'https://gw.test/v1', model: 'm', name: 'M', keyFile: '/k', vision: false };
+const CONFIG = { baseUrl: 'https://gw.test/v1', model: 'm', name: 'M', keyFile: '/k', vision: false, look: null };
 /** A conversation kept in memory, as the project's file would keep it. */
 const memoryLog = (kept = new Map()) => ({ kept, load: (path) => structuredClone(kept.get(path) ?? []), save: (path, entries) => { kept.set(path, structuredClone(entries)); } });
 const tick = () => new Promise((done) => setImmediate(done));
@@ -12,7 +14,7 @@ test('the agent is off without a gateway and a model, and refuses a gateway that
   assert.equal(agentConfig({}), null);
   assert.equal(agentConfig({ OPENFILM_AGENT_BASE_URL: 'https://gw.test/v1' }), null, 'no model');
   const on = agentConfig({ OPENFILM_AGENT_BASE_URL: 'https://gw.test/v1/', OPENFILM_AGENT_MODEL: ' qwen ', OPENFILM_AGENT_KEY_FILE: '/run/k' });
-  assert.deepEqual(on, { baseUrl: 'https://gw.test/v1', model: 'qwen', name: 'qwen', keyFile: '/run/k', vision: false });
+  assert.deepEqual(on, { baseUrl: 'https://gw.test/v1', model: 'qwen', name: 'qwen', keyFile: '/run/k', vision: false, look: null });
   assert.equal(agentConfig({ OPENFILM_AGENT_BASE_URL: 'http://127.0.0.1:4000/v1', OPENFILM_AGENT_MODEL: 'q', OPENFILM_AGENT_VISION: '1' })?.vision, true);
   assert.throws(() => agentConfig({ OPENFILM_AGENT_BASE_URL: 'http://gw.test/v1', OPENFILM_AGENT_MODEL: 'q' }), /https/);
   assert.throws(() => agentConfig({ OPENFILM_AGENT_BASE_URL: 'http://localhost.evil.test/v1', OPENFILM_AGENT_MODEL: 'q' }), /https/);
@@ -145,4 +147,20 @@ test('a page opened again on a project is shown its conversation so far, kept wi
   const again = [];
   createAgentHub({ config: CONFIG, start, log }).join({ path: '/p' }, (e) => again.push(e));
   assert.deepEqual(again[1], { kind: 'history', entries: expected });
+});
+
+test('a model that reads no pictures is given eyes when the gateway has one that does; a model that reads them is not', () => {
+  const base = { OPENFILM_AGENT_BASE_URL: 'https://gw.test/v1', OPENFILM_AGENT_MODEL: 'q' };
+  assert.equal(agentConfig({ ...base, OPENFILM_AGENT_LOOK_MODEL: ' qwen2.5vl ' })?.look, 'qwen2.5vl');
+  assert.equal(agentConfig({ ...base, OPENFILM_AGENT_LOOK_MODEL: 'qwen2.5vl', OPENFILM_AGENT_VISION: '1' })?.look, null);
+  assert.equal(agentConfig(base)?.look, null);
+});
+
+test('regarder is written beside openfilm: this Node running look.mjs, with what the agent gives it', { skip: process.platform === 'win32' }, () => {
+  const bin = mkdtempSync(join(tmpdir(), 'look-'));
+  const file = installLook(bin, "/opt/no'de");
+  const script = readFileSync(file, 'utf8');
+  assert.match(script, /^#!\/bin\/sh\n/);
+  assert.match(script, /exec '\/opt\/no'\\''de' '[^']*look\.mjs' "\$@"\n$/);
+  assert.equal(statSync(file).mode & 0o111, 0o111, 'executable');
 });

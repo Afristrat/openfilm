@@ -8,6 +8,8 @@
  *   OPENFILM_AGENT_NAME      what the page calls it (the model's name when none)
  *   OPENFILM_AGENT_KEY_FILE  the file its key is in (<Studio's home>/agent/litellm.key when none), read as a session starts
  *   OPENFILM_AGENT_VISION    1 when the model reads pictures; otherwise Pi leaves them out of its requests
+ *   OPENFILM_AGENT_LOOK_MODEL when the model reads none: a model of the same gateway that does, behind the agent's
+ *                            `regarder` command (look.mjs), which it is told of as its conversation starts
  * Without a gateway and a model the agent is off and the page says so.
  *
  * One agent per project, whichever pages are open on it: each page sees every turn (the person's words, the agent's
@@ -19,8 +21,9 @@
  * A project's conversation is taken up again when its agent starts anew (<project>/.film/agent/web.json keeps which),
  * and what was said is kept for the pages in <project>/.film/agent/web-log.json (the last MAX_ENTRIES entries).
  */
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { studioHome } from './projects.mjs';
 
 /** The longest message a page may send (the socket closes above MAX_FRAME, 1 MiB, anyway). */
@@ -50,7 +53,26 @@ export function agentConfig(env = process.env) {
     name: env.OPENFILM_AGENT_NAME?.trim() || model,
     keyFile: env.OPENFILM_AGENT_KEY_FILE?.trim() || join(studioHome(), 'agent', 'litellm.key'),
     vision: env.OPENFILM_AGENT_VISION === '1',
+    look: env.OPENFILM_AGENT_VISION === '1' ? null : env.OPENFILM_AGENT_LOOK_MODEL?.trim() || null,
   };
+}
+
+/** What the agent is told, with its first words each time its process starts, when it has `regarder`. */
+export const LOOK_NOTE = 'Note de Studio : ton modèle ne lit pas les images. Pour voir une image ou une vidéo du projet, lance dans le shell '
+  + '`regarder <fichier> [--at <secondes>] [question]` : un modèle qui voit la regarde et te répond en mots (une vidéo : '
+  + 'l’image à ce moment, la première sans --at). Regarde avant de juger un cadrage, un titre, une incrustation ou un rendu.';
+
+/**
+ * Write the `regarder` command into `bin` (beside `openfilm`): this server's Node running look.mjs.
+ * @param {string} bin @param {string} [node]
+ */
+export function installLook(bin, node = process.execPath) {
+  const file = join(bin, 'regarder');
+  const q = (/** @type {string} */ v) => `'${v.replace(/'/g, `'\\''`)}'`;
+  const look = fileURLToPath(new URL('look.mjs', import.meta.url));
+  writeFileSync(file, `#!/bin/sh\n# Studio's regarder command (written by the server; changes are lost)\nexec ${q(node)} ${q(look)} "$@"\n`);
+  chmodSync(file, 0o755);
+  return file;
 }
 
 /**
@@ -231,7 +253,7 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectL
 /**
  * A project's agent started: Pi through the desktop's AgentSession, in the project's folder, the `openfilm` command
  * (written under <home>/agent/bin) first on its PATH, OpenFilm's skills, its conversation taken up again when the
- * project had one. Every permission it asks is refused and every question declined: the page has no place for them yet.
+ * project had one. With a looking model (config.look), `regarder` beside it and LOOK_NOTE before its first words. Every permission it asks is refused and every question declined: the page has no place for them yet.
  * @param {{ path: string }} project @param {(update: unknown) => void} onUpdate
  * @param {{ config: NonNullable<ReturnType<typeof agentConfig>>, home?: string }} options
  * @returns {Promise<Started>}
@@ -246,12 +268,18 @@ export async function startPiSession(project, onUpdate, { config, home = studioH
   const kept = join(project.path, '.film', 'agent', 'web.json');
   let resume = null;
   try { resume = JSON.parse(readFileSync(kept, 'utf8')).sessionId ?? null; } catch { /* a first conversation */ }
+  const binDir = installOpenfilmCommand(dataDir, {});
+  if (config.look) installLook(binDir);
   const session = new AgentSession({
     agent: 'byok',
     cwd: project.path,
     resume,
-    binDir: installOpenfilmCommand(dataDir, {}),
-    env: { OPENFILM_HOME: home, OPENFILM_AGENT: 'web' },
+    binDir,
+    env: {
+      OPENFILM_HOME: home,
+      OPENFILM_AGENT: 'web',
+      ...(config.look ? { OPENFILM_LOOK: JSON.stringify({ baseUrl: config.baseUrl, model: config.look, keyFile: config.keyFile }) } : {}),
+    },
     harness: harnessOf(config, key, home),
     skills: { dataDir, mine: mySkillsDir(), prefsHome: home },
     onUpdate,
@@ -261,8 +289,13 @@ export async function startPiSession(project, onUpdate, { config, home = studioH
   const info = await session.start();
   mkdirSync(dirname(kept), { recursive: true });
   writeFileSync(kept, `${JSON.stringify({ sessionId: info.sessionId })}\n`);
+  let told = !config.look;
   return {
-    prompt: (text) => session.prompt([{ type: 'text', text }]),
+    prompt: (text) => {
+      const note = told ? [] : [{ type: 'text', text: LOOK_NOTE }];
+      told = true;
+      return session.prompt([...note, { type: 'text', text }]);
+    },
     cancel: () => session.cancel(),
     close: () => session.close(),
   };

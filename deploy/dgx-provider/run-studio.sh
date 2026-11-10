@@ -2,7 +2,9 @@
 # Lance (ou relance) le conteneur Studio sur DGX spark-1540. Usage : sh run-studio.sh [tag de l'image, défaut 0.3.1]
 # Studio n'écoute que 127.0.0.1 (réseau de l'hôte) ; film.ai-mpower.com y arrive par le relais SSH de serveuria.
 # Agent du panneau (studio/server/agent.mjs) : passerelle LiteLLM d'AI-MPower, modèle local ; sa clé (alias openfilm-agent,
-# bornée à ce modèle) est dans le volume, /root/.openfilm/agent/litellm.key, jamais dans ce fichier.
+# bornée à ces modèles) est dans le volume, /root/.openfilm/agent/litellm.key, jamais dans ce fichier.
+# Qwen 3.8 ne lit pas les images (tensorfold refuse --vision sur le checkpoint NVFP4, essai du 2026-11-10) : l'agent a la
+# commande regarder (look.mjs), servie par qwen2.5vl-7b-local (Ollama sur serveuria, processeur : environ 10 s par image).
 # Plafonds (SOP-020) : 24 Go de mémoire, 4096 processus (18 au repos mesurés le 2026-11-09 ; le rendu lance Chromium et ffmpeg).
 set -e
 TAG="${1:-0.3.1}"
@@ -16,5 +18,6 @@ docker run -d --name openfilm-studio --restart unless-stopped --network host --g
   -e OPENFILM_PUBLIC_FILM_ORIGIN=https://film-apercu.ai-mpower.com \
   -e OPENFILM_AGENT_BASE_URL=https://proxy.ai-mpower.com/v1 \
   -e OPENFILM_AGENT_MODEL=qwen3.8-27b \
-  -e "OPENFILM_AGENT_NAME=Qwen 3.8 27B (DGX, sans vision)" \
+  -e "OPENFILM_AGENT_NAME=Qwen 3.8 27B (DGX, regarde avec Qwen 2.5 VL)" \
+  -e OPENFILM_AGENT_LOOK_MODEL=qwen2.5vl-7b-local \
   "openfilm-studio:$TAG"
