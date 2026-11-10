@@ -7,7 +7,7 @@
  * ffmpeg runs a few at a time: a project opened with fifty clips must not start fifty decoders. The editor's sound of
  * each file (soundOf) is made a few at a time of its own, so a long recording's does not hold up the thumbnails.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, rm, stat } from 'node:fs/promises';
@@ -138,25 +138,53 @@ const RATE = 8000;
  */
 export async function waveform(root, rel) {
   const { abs, key } = await source(root, rel);
-  const bytes = await cached(root, 'waves', `${key}.json`, async () => {
-    const pcm = await tool('ffmpeg', ['-v', 'error', '-i', abs, '-vn', '-ac', '1', '-ar', String(RATE), '-f', 's16le', '-']);
-    return Buffer.from(JSON.stringify(peaksOf(pcm)));
-  });
+  const bytes = await cached(root, 'waves', `${key}.json`, async () => Buffer.from(JSON.stringify(await peaksOfSound(abs))));
   return JSON.parse(bytes.toString());
 }
 
-/** Mono 16-bit samples at RATE → `{ duration (s), peaks }`. */
-function peaksOf(/** @type {Buffer} */ pcm) {
-  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, Math.floor(pcm.length / 2));
-  const per = RATE / PEAKS_PER_SECOND;
-  const peaks = [];
-  for (let i = 0; i < samples.length; i += per) {
-    let max = 0;
-    const end = Math.min(samples.length, i + per);
-    for (let j = i; j < end; j++) { const v = Math.abs(samples[j]); if (v > max) max = v; }
-    peaks.push(Math.round((max / 32768) * 1000) / 1000);
+/**
+ * The peaks of a file's sound, read as ffmpeg decodes it (mono 16-bit at RATE): any length, never the whole sound in
+ * memory (an hour and a half is 90 MB of samples). `{ duration (s), peaks }`.
+ * @param {string} abs @returns {Promise<{ duration: number, peaks: number[] }>}
+ */
+async function peaksOfSound(abs) {
+  if (SLOTS.busy >= SLOTS.size) await new Promise((r) => SLOTS.waiting.push(() => r(undefined)));
+  SLOTS.busy++;
+  try {
+    return await new Promise((resolve, reject) => {
+      const child = spawn('ffmpeg', ['-v', 'error', '-i', abs, '-vn', '-ac', '1', '-ar', String(RATE), '-f', 's16le', '-'], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+      const per = RATE / PEAKS_PER_SECOND;
+      /** @type {number[]} */
+      const peaks = [];
+      let count = 0, max = 0, inPeak = 0;
+      /** @type {Buffer | null} */
+      let odd = null;
+      let stderr = '';
+      child.stdout.on('data', (/** @type {Buffer} */ chunk) => {
+        const data = odd ? Buffer.concat([odd, chunk]) : chunk;
+        const whole = data.length - (data.length % 2);
+        odd = whole < data.length ? data.subarray(whole) : null;
+        for (let i = 0; i < whole; i += 2) {
+          const v = Math.abs(data.readInt16LE(i));
+          if (v > max) max = v;
+          if (++inPeak === per) { peaks.push(Math.round((max / 32768) * 1000) / 1000); max = 0; inPeak = 0; }
+        }
+        count += whole / 2;
+      });
+      child.stderr.on('data', (d) => { stderr = (stderr + String(d)).slice(-4000); });
+      child.once('error', (e) => reject(/** @type {NodeJS.ErrnoException} */ (e).code === 'ENOENT'
+        ? new MediaError('ffmpeg is not installed (macOS: brew install ffmpeg · Debian/Ubuntu: sudo apt install ffmpeg · Windows: winget install ffmpeg)', 501)
+        : e));
+      child.once('close', (code) => {
+        if (code !== 0) return reject(new MediaError(stderr.trim().split('\n').pop() || `ffmpeg ended with code ${code}`));
+        if (inPeak) peaks.push(Math.round((max / 32768) * 1000) / 1000);
+        resolve({ duration: count / RATE, peaks });
+      });
+    });
+  } finally {
+    SLOTS.busy--;
+    SLOTS.waiting.shift()?.();
   }
-  return { duration: samples.length / RATE, peaks };
 }
 
 /** Sound files small and compressed enough to be played as they are. */

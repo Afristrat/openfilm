@@ -741,3 +741,26 @@ test('a write over a file that still holds what it was made from is in place whe
   assert.equal(readFileSync(path, 'utf8'), 'new');
   assert.deepEqual(readdirSync(dir), ['film.html'], 'no bytes on their way left beside it, written or not');
 });
+
+test('an agent takes back what it added itself: the person did nothing since, its removal stands (not taken for an older copy)', async () => {
+  const root = await project(F([page('t', { at: 1 })]));
+  write(root, F([page('t', { at: 1 }), page('x', { at: 20 })]));
+  await settleProjectFilm(root);
+  assert.deepEqual(ids(read(root)), [['t', 'x']]);
+  write(root, F([page('t', { at: 1 })]));
+  await settleProjectFilm(root);
+  assert.deepEqual(ids(read(root)), [['t']], 'the clip the agent added and removed stays removed');
+});
+
+test('an agent takes back what it added itself after the person had edited earlier: the person\'s edit stays, the removal stands', async () => {
+  const root = await project(F([page('t', { at: 1 })]));
+  await editProjectFilm(root, null, [{ op: 'set', clip: 't', field: 'at', value: 2 }]);
+  tell(root);
+  write(root, F([page('t', { at: 2 }), page('x', { at: 20 })]));
+  await settleProjectFilm(root);
+  assert.deepEqual(ids(read(root)), [['t', 'x']]);
+  write(root, F([page('t', { at: 2 })]));
+  await settleProjectFilm(root);
+  assert.deepEqual(ids(read(root)), [['t']], 'the clip the agent added and removed stays removed');
+  assert.equal(clip(read(root), 't').at, 2);
+});

@@ -46,12 +46,14 @@ import { compare, hashOf, keepFilm, keptClips, keptHash, keptSize, keptValue, li
  * the one before (its units), so edits of one thing in a row are kept as one version (a drag, say).
  * `over`: a write Studio wrote a merge over (what it had there was kept out of the film). `gap`: versions right before
  * it were let go. The first version is never let go.
- * @typedef {{ hash: string, film?: KeptFilm, data?: Buffer | null, size: number, person: boolean, anchor: boolean, changed?: string, over?: boolean, gap?: boolean }} Version
+ * `seen`: when Studio last saw it (the merges' clock), a version seen again moving to the end.
+ * @typedef {{ hash: string, film?: KeptFilm, data?: Buffer | null, size: number, person: boolean, anchor: boolean, changed?: string, over?: boolean, gap?: boolean, seen?: number }} Version
  */
 /**
  * One file's record: its versions (oldest first), what Studio has now (`ours`: the last it wrote or took in; `film`
  * for film.html), what it last saw there (`seen`: a write of that is Studio's own), and when the person last wrote it.
- * @typedef {{ versions: Version[], ours: Buffer | null, seen: Buffer | string | null, film?: KeptFilm | null, at?: number }} Kept
+ * `personSeen` (film.html): the clock when the person last wrote it.
+ * @typedef {{ versions: Version[], ours: Buffer | null, seen: Buffer | string | null, film?: KeptFilm | null, at?: number, personSeen?: number }} Kept
  */
 /**
  * A note an agent passed on: which agent, the units it named (for a file, `file␀path`), the version of film.html Studio
@@ -135,7 +137,7 @@ function addVersion(s, kept, { film, data = null, person = false, changed, ancho
   const had = kept.versions.findIndex((v) => v.hash === hash);
   if (had >= 0) {
     const [v] = kept.versions.splice(had, 1);
-    kept.versions.push(Object.assign(v, { anchor: v.anchor || anchor, person: v.person && person }));
+    kept.versions.push(Object.assign(v, { anchor: v.anchor || anchor, person: v.person && person, seen: ++clock }));
     return;
   }
   const last = kept.versions.at(-1);
@@ -143,7 +145,7 @@ function addVersion(s, kept, { film, data = null, person = false, changed, ancho
   else if (person && last && !last.person) last.anchor = true;
   const before = kept.versions.at(-1)?.film;
   const size = film ? keptSize(film, (t) => !before?.tracks.includes(t)) : data == null ? 0 : deflateRawSync(data).length;
-  kept.versions.push({ hash, ...(film ? { film } : { data: data == null ? null : deflateRawSync(data) }), size, person, anchor: anchor || !kept.versions.length, ...(changed ? { changed } : {}) });
+  kept.versions.push({ hash, ...(film ? { film } : { data: data == null ? null : deflateRawSync(data) }), size, person, anchor: anchor || !kept.versions.length, ...(changed ? { changed } : {}), seen: ++clock });
   /* the oldest version that may go, but never the first nor the last two; its bytes, or -1 when none may. The one
      after it knows a version before it was let go */
   const drop = (/** @type {Kept} */ k, /** @type {boolean | null} */ anchors) => {
@@ -205,6 +207,7 @@ export function filmWritten(root, before, after, rev, _edit = {}) {
   addVersion(s, kept, { film: now, person: true, changed: changed.join('\n') });
   kept.film = now;
   kept.seen = rev;
+  kept.personSeen = kept.versions.at(-1)?.seen;
 }
 
 /** The project put back as a version had it, or its changes discarded: the person's as it is, nothing to merge into. */
@@ -260,7 +263,19 @@ export async function mergeFilmWrite(root, { rev, value }) {
   const input = { ours: keptValue(ours), write: value, versions, over: kept.versions.map((v) => Boolean(v.over)), gaps: kept.versions.map((v) => Boolean(v.gap)), added: [...s.added].filter((id) => ourIds.has(id)), acks, notes, mine: [...s.mine], taken: [...s.taken], renames: s.renames };
   /** @type {ReturnType<typeof mergeWrite>} */
   let merge;
-  try {
+  /* a write that is exactly a version Studio had, seen since the person last wrote the film (nothing of theirs after
+     it, none let go, not a write Studio merged over): a step back by whoever wrote since, an agent taking back what it had added itself, say. Nothing
+     of the person's to keep: taken as it is. Merged, it reads as an older copy, and what was taken back is put back */
+  /* (the versions it may be, found first: hashing a long film is not free, and there is seldom one) */
+  let after = kept.versions.length - 1;
+  while (after > 0 && !kept.versions[after].person && !kept.versions[after].gap) after--;
+  const may = kept.versions.slice(0, -1).map((v, i) => (i >= after && !v.over && (v.seen ?? 0) >= (kept.personSeen ?? 0) ? i : -1)).filter((i) => i >= 0);
+  const hash = may.length ? keptHash(keepFilm(value, ours)) : null;
+  const same = may.find((i) => kept.versions[i].hash === hash) ?? -1;
+  if (same >= 0) {
+    merge = { value, kept: [], base: same, note: -1, renamed: [], agreed: [] };
+    last.set(root, { base: kept.versions[same].hash, note: null, latest: false, far: false });
+  } else try {
     merge = keptClips(ours) >= CLIPS_IN_WORKER ? await inWorker(root, input).catch((e) => (e.late ? Promise.reject(e) : merging(input))) : merging(input);
     last.set(root, { base: kept.versions[merge.base].hash, note: notesOn[merge.note]?.agent ?? null, latest: Boolean(acks[merge.note]?.latest), far: kept.versions.slice(0, merge.base + 1).some((v) => v.gap) });
   } catch (e) {

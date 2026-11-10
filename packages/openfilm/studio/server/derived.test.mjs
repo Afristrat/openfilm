@@ -34,7 +34,13 @@ test('probe: a still\'s size, and a video turned a quarter (a phone\'s portrait 
   execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'testsrc=size=300x200', '-frames:v', '1', join(root, 'assets', 'still.png')]);
   const still = await probe(root, 'assets/still.png');
   assert.deepEqual([still.width, still.height, still.duration], [300, 200, undefined]);
-  execFileSync('ffmpeg', ['-v', 'error', '-display_rotation', '90', '-i', join(root, 'assets', 'clip.mp4'), '-c', 'copy', join(root, 'assets', 'turned.mp4')]);
+  /* turned as a phone does (a display matrix): `-display_rotation` from ffmpeg 6 on, the `rotate` tag before it (Debian 12 has 5.1) */
+  const turnedFile = join(root, 'assets', 'turned.mp4');
+  try {
+    execFileSync('ffmpeg', ['-v', 'error', '-y', '-display_rotation', '90', '-i', join(root, 'assets', 'clip.mp4'), '-c', 'copy', turnedFile], { stdio: 'pipe' });
+  } catch {
+    execFileSync('ffmpeg', ['-v', 'error', '-y', '-i', join(root, 'assets', 'clip.mp4'), '-c', 'copy', '-metadata:s:v:0', 'rotate=-90', turnedFile]);
+  }
   const turned = await probe(root, 'assets/turned.mp4');
   assert.deepEqual([turned.width, turned.height], [180, 320]);
 });
@@ -63,6 +69,15 @@ test('waveform: loud where the tone is, silent after', { skip: !hasFfmpeg && 'no
   assert.ok(Math.abs(duration - 2) < 0.05);
   assert.ok(Math.abs(peaks.length - 80) <= 1);
   assert.ok(peaks[10] > 0.05 && peaks[70] < 0.001, `${peaks[10]} ${peaks[70]}`);
+});
+
+test('waveform of a long recording (past 70 minutes): read as it decodes, whole', { skip: !hasFfmpeg && 'no ffmpeg', timeout: 120_000 }, async () => {
+  /* 75 minutes of a quiet tone, the length an interview runs to (at 8 kHz, past the 64 MB the decoder's output once had) */
+  execFileSync('ffmpeg', ['-v', 'error', '-f', 'lavfi', '-i', 'sine=frequency=300:sample_rate=8000:duration=4500', '-c:a', 'libopus', '-b:a', '6k', join(root, 'assets', 'long.ogg')]);
+  const { duration, peaks } = await waveform(root, 'assets/long.ogg');
+  assert.ok(Math.abs(duration - 4500) < 1, String(duration));
+  assert.ok(Math.abs(peaks.length - 4500 * 40) <= 2, String(peaks.length));
+  assert.ok(peaks[4499 * 40] > 0.05, 'heard to the end');
 });
 
 test('loudness: the part of the file asked for, in LUFS; 6 dB quieter reads 6 LU less; silence has none', { skip: !hasFfmpeg && 'no ffmpeg' }, async () => {
