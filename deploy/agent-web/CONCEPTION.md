@@ -61,4 +61,20 @@ Ce que l'hôte web implémente :
   bornée ; `providers.json` ne contient aucune clé (vérifié). Le risque restant est l'accès au réseau local depuis une
   commande, par exemple sur injection de consigne via une page lue par `openfilm get web-fetch`. L'accès à la page reste
   fermé par le mot de passe du relais et la clé de Studio.
-- Demandes de permission et questions de l'agent : refusées pour l'instant (étape 4).
+- Demandes de permission et questions de l'agent : voir l'étape 4.
+
+## Réalisation de l'étape 4 (2026-11-10)
+
+- Arbitrage par la personne : les questions de l'outil `ask` de Pi et ses demandes d'autorisation passent du serveur
+  (`createAgentHub`, événements `question`, `permission`, `answered`) au panneau, où elles s'affichent en carte : un
+  bouton par choix, une réponse libre, « Passer (l'agent décide) ». Toutes les pages ouvertes la voient, une page
+  ouverte pendant l'attente aussi ; la première réponse tranche. Sans réponse en 10 minutes (`ASK_MS`), ou si le tour
+  est arrêté, l'agent décide lui-même et le dit : il ne reste jamais bloqué. Question et réponse restent dans la
+  conversation du projet.
+- Prouvé sur le site public (commit 1478a0b, image `openfilm-studio:ask-1478a0b`) : question affichée en 24 s,
+  réponse « 3 minutes » par le bouton, l'agent la reprend (« Durée retenue : 3 minutes »), la page rouverte la montre.
+- Choix du modèle dans Settings → Agents : non construit, par décision documentée. La clé de l'agent (`openfilm-agent`)
+  n'ouvre que `qwen3.8-27b` (le cerveau) et `qwen2.5vl-7b-local` (les yeux, sur le processeur de serveuria, trop lent
+  pour conduire l'agent) : un menu n'aurait qu'un choix. Le modèle se change par `OPENFILM_AGENT_MODEL` dans
+  `run-studio.sh`. Réexaminer dès qu'un second modèle local capable d'appeler des outils est servi par la passerelle.
+- `refer`, `ask` (⌘L de Studio), `onSelection` : non branchés ; l'agent lit le film et ses fichiers lui-même.
