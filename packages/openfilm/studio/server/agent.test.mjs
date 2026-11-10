@@ -1,9 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { MAX_PROMPT, agentConfig, createAgentHub, harnessOf, readSaid } from './agent.mjs';
+import { MAX_ENTRIES, MAX_PROMPT, agentConfig, createAgentHub, harnessOf, noteEvent, readSaid } from './agent.mjs';
 
 const CONFIG = { baseUrl: 'https://gw.test/v1', model: 'm', name: 'M', keyFile: '/k', vision: false };
+/** A conversation kept in memory, as the project's file would keep it. */
+const memoryLog = (kept = new Map()) => ({ kept, load: (path) => structuredClone(kept.get(path) ?? []), save: (path, entries) => { kept.set(path, structuredClone(entries)); } });
 const tick = () => new Promise((done) => setImmediate(done));
 
 test('the agent is off without a gateway and a model, and refuses a gateway that would send its key in the clear', () => {
@@ -42,6 +44,7 @@ test('one agent per project: started on the first message, every page sees the t
   let finish = () => {};
   const hub = createAgentHub({
     config: CONFIG,
+    log: memoryLog(),
     start: async (_project, onUpdate) => {
       started++;
       return { prompt: (text) => { onUpdate({ said: text }); return new Promise((done) => { finish = done; }); }, cancel: () => {}, close: () => {} };
@@ -71,7 +74,7 @@ test('one agent per project: started on the first message, every page sees the t
 
 test('an agent that cannot start says why, and the next message tries again', async () => {
   let tries = 0;
-  const hub = createAgentHub({ config: CONFIG, start: async () => { tries++; throw new Error('gateway down'); } });
+  const hub = createAgentHub({ config: CONFIG, log: memoryLog(), start: async () => { tries++; throw new Error('gateway down'); } });
   const seen = [];
   const page = hub.join({ path: '/p' }, (e) => seen.push(e));
   page.said('{"type":"prompt","text":"a"}');
@@ -83,7 +86,7 @@ test('an agent that cannot start says why, and the next message tries again', as
 });
 
 test('without a model the page is told so, and nothing starts', () => {
-  const hub = createAgentHub({ config: null, start: () => { throw new Error('never'); } });
+  const hub = createAgentHub({ config: null, log: memoryLog(), start: () => { throw new Error('never'); } });
   const seen = [];
   hub.join({ path: '/p' }, (e) => seen.push(e)).said('{"type":"prompt","text":"a"}');
   assert.equal(seen[0].available, false);
@@ -92,11 +95,54 @@ test('without a model the page is told so, and nothing starts', () => {
 
 test('an agent nobody looks at ends after a while', async () => {
   let closed = 0;
-  const hub = createAgentHub({ config: CONFIG, idleMs: 5, start: async () => ({ prompt: async () => 'end_turn', cancel: () => {}, close: () => { closed++; } }) });
+  const hub = createAgentHub({ config: CONFIG, log: memoryLog(), idleMs: 5, start: async () => ({ prompt: async () => 'end_turn', cancel: () => {}, close: () => { closed++; } }) });
   const page = hub.join({ path: '/p' }, () => {});
   page.said('{"type":"prompt","text":"a"}');
   await tick(); await tick();
   page.leave();
   await new Promise((done) => setTimeout(done, 30));
   assert.equal(closed, 1);
+});
+
+test('the conversation as a page shows it: the words joined, each tool and how it ended, a stop; never more than MAX_ENTRIES', () => {
+  const entries = [];
+  for (const e of [
+    { kind: 'turn', text: 'bonjour' },
+    { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Je ' } } },
+    { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'regarde.' } } },
+    { kind: 'update', update: { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'ls', status: 'pending' } },
+    { kind: 'update', update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hmm' } } },
+    { kind: 'update', update: { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' } },
+    { kind: 'update', update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Fait.' } } },
+    { kind: 'done', stopReason: 'end_turn' },
+    { kind: 'done', stopReason: 'cancelled' },
+    { kind: 'error', message: 'panne' },
+  ]) noteEvent(entries, e);
+  assert.deepEqual(entries, [
+    { kind: 'turn', text: 'bonjour' }, { kind: 'reply', text: 'Je regarde.' }, { kind: 'tool', id: 't1', title: 'ls', status: 'completed' },
+    { kind: 'reply', text: 'Fait.' }, { kind: 'stopped' }, { kind: 'error', message: 'panne' },
+  ]);
+  const many = [];
+  for (let i = 0; i < MAX_ENTRIES + 10; i++) noteEvent(many, { kind: 'turn', text: String(i) });
+  assert.equal(many.length, MAX_ENTRIES);
+  assert.deepEqual(many[0], { kind: 'turn', text: '10' }, 'the oldest go first');
+});
+
+test('a page opened again on a project is shown its conversation so far, kept with the project', async () => {
+  const log = memoryLog();
+  const start = async (_p, onUpdate) => ({ prompt: async () => { onUpdate({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'ciao' } }); return 'end_turn'; }, cancel: () => {}, close: () => {} });
+  const hub = createAgentHub({ config: CONFIG, start, log });
+  const first = [];
+  const page = hub.join({ path: '/p' }, (e) => first.push(e));
+  assert.equal(first.some((e) => e.kind === 'history'), false, 'nothing said yet: no history');
+  page.said('{"type":"prompt","text":"salve"}');
+  await tick(); await tick();
+  page.leave();
+  const expected = [{ kind: 'turn', text: 'salve' }, { kind: 'reply', text: 'ciao' }];
+  assert.deepEqual(log.kept.get('/p'), expected, 'kept when the turn ends');
+  hub.closeAll();
+  /* Studio restarted: a new hub, the same project */
+  const again = [];
+  createAgentHub({ config: CONFIG, start, log }).join({ path: '/p' }, (e) => again.push(e));
+  assert.deepEqual(again[1], { kind: 'history', entries: expected });
 });

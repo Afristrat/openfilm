@@ -171,6 +171,16 @@
   function heard(event) {
     if (event.kind === 'ready') { agent.ready = true; agent.available = event.available; agent.busy = event.busy; agent.model = event.model; agent.retry = 0; }
     else if (event.kind === 'turn') { agent.busy = true; agent.reply = null; agent.tools = {}; bubble('person', event.text); }
+    else if (event.kind === 'history') {
+      /* the conversation so far (the server keeps it with the project): a page opened again shows it */
+      (event.entries || []).forEach(function (e) {
+        if (e.kind === 'turn') bubble('person', e.text);
+        else if (e.kind === 'reply') bubble('agent', readable(e.text));
+        else if (e.kind === 'tool') agent.tools[e.id] = { node: toolLine(e.title, e.status), title: e.title };
+        else if (e.kind === 'error') bubble('error', e.message);
+        else if (e.kind === 'stopped') bubble('error', 'Tour arrêté.');
+      });
+    }
     else if (event.kind === 'busy') bubble('error', 'L’agent travaille déjà : attendez la fin de son tour, ou arrêtez-le.');
     else if (event.kind === 'error') { agent.busy = false; agent.reply = null; bubble('error', event.message || 'Erreur'); }
     else if (event.kind === 'done') { agent.busy = false; agent.reply = null; if (event.stopReason === 'cancelled') bubble('error', 'Tour arrêté.'); }

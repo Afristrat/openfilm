@@ -15,7 +15,9 @@
  *   in:  {type: 'prompt', text} · {type: 'cancel'}
  *   out: {kind: 'ready', available, busy, model} · {kind: 'turn', text} · {kind: 'update', update} (ACP session/update)
  *        · {kind: 'busy'} · {kind: 'done', stopReason} · {kind: 'error', message}
- * A project's conversation is taken up again when its agent starts anew (<project>/.film/agent/web.json keeps which).
+ *        · {kind: 'history', entries} right after `ready`: the conversation so far, for a page opened (again) on it
+ * A project's conversation is taken up again when its agent starts anew (<project>/.film/agent/web.json keeps which),
+ * and what was said is kept for the pages in <project>/.film/agent/web-log.json (the last MAX_ENTRIES entries).
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -25,6 +27,8 @@ import { studioHome } from './projects.mjs';
 export const MAX_PROMPT = 32_000;
 /** How long an agent nobody looks at and that is not working stays started (its process and model connection). */
 export const IDLE_MS = 15 * 60_000;
+/** How many entries of a conversation are kept for the pages (its words, the agent's, its tools). */
+export const MAX_ENTRIES = 400;
 /** The desktop app's agent code, beside this package in the repository the server runs from. */
 const DESKTOP = new URL('../../../../apps/desktop/src/', import.meta.url);
 
@@ -89,23 +93,69 @@ export function readSaid(text) {
 }
 
 /**
+ * @typedef {{ kind: 'turn', text: string } | { kind: 'reply', text: string } | { kind: 'tool', id: string, title: string, status: string }
+ *   | { kind: 'error', message: string } | { kind: 'stopped' }} Entry
+ */
+
+/**
+ * The conversation as a page shows it, one event more: the person's words, the agent's words (its pieces joined),
+ * each tool it ran and how that ended, an error, a turn stopped. The rest of what the agent says is not kept.
+ * @param {Entry[]} entries @param {any} event @returns {Entry[]}
+ */
+export function noteEvent(entries, event) {
+  const last = entries.at(-1);
+  if (event?.kind === 'turn') entries.push({ kind: 'turn', text: String(event.text) });
+  else if (event?.kind === 'error') entries.push({ kind: 'error', message: String(event.message) });
+  else if (event?.kind === 'done' && event.stopReason === 'cancelled') entries.push({ kind: 'stopped' });
+  else if (event?.kind === 'update') {
+    const u = event.update ?? {};
+    if (u.sessionUpdate === 'agent_message_chunk' && u.content?.type === 'text') {
+      if (last?.kind === 'reply') last.text += u.content.text;
+      else entries.push({ kind: 'reply', text: String(u.content.text) });
+    } else if (u.sessionUpdate === 'tool_call') {
+      entries.push({ kind: 'tool', id: String(u.toolCallId ?? ''), title: String(u.title ?? ''), status: String(u.status ?? 'pending') });
+    } else if (u.sessionUpdate === 'tool_call_update') {
+      const tool = /** @type {any} */ (entries.findLast((e) => e.kind === 'tool' && e.id === u.toolCallId));
+      if (tool) { if (u.title) tool.title = String(u.title); if (u.status) tool.status = String(u.status); }
+    }
+  }
+  if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
+  return entries;
+}
+
+/** Where a project's conversation is kept for its pages. */
+const logFile = (/** @type {string} */ path) => join(path, '.film', 'agent', 'web-log.json');
+/** @type {{ load: (path: string) => Entry[], save: (path: string, entries: Entry[]) => void }} */
+export const projectLog = {
+  load(path) {
+    try { const kept = JSON.parse(readFileSync(logFile(path), 'utf8')); return Array.isArray(kept) ? kept.slice(-MAX_ENTRIES) : []; } catch { return []; }
+  },
+  save(path, entries) {
+    mkdirSync(dirname(logFile(path)), { recursive: true });
+    writeFileSync(logFile(path), `${JSON.stringify(entries)}\n`);
+  },
+};
+
+/**
  * @typedef {{ prompt: (text: string) => Promise<unknown>, cancel: () => Promise<unknown> | void, close: () => void }} Started
  * @typedef {(project: { path: string }, onUpdate: (update: unknown) => void) => Promise<Started>} Start
  */
 
 /**
  * The agents of every project, each started on its first message (`start`), and the pages open on them.
- * @param {{ config: ReturnType<typeof agentConfig>, start: Start, idleMs?: number }} options
+ * `log`: where each project's conversation is kept for its pages (projectLog: in the project).
+ * @param {{ config: ReturnType<typeof agentConfig>, start: Start, idleMs?: number, log?: typeof projectLog }} options
  */
-export function createAgentHub({ config, start, idleMs = IDLE_MS }) {
-  /** @type {Map<string, { pages: Set<(event: unknown) => void>, session: Promise<Started> | null, busy: boolean, idle: ReturnType<typeof setTimeout> | null }>} */
+export function createAgentHub({ config, start, idleMs = IDLE_MS, log = projectLog }) {
+  /** @type {Map<string, { pages: Set<(event: unknown) => void>, session: Promise<Started> | null, busy: boolean, idle: ReturnType<typeof setTimeout> | null, entries: Entry[] }>} */
   const rooms = new Map();
   const roomOf = (/** @type {string} */ path) => {
     let room = rooms.get(path);
-    if (!room) rooms.set(path, (room = { pages: new Set(), session: null, busy: false, idle: null }));
+    if (!room) rooms.set(path, (room = { pages: new Set(), session: null, busy: false, idle: null, entries: log.load(path) }));
     return room;
   };
-  const tell = (/** @type {{ pages: Set<(event: unknown) => void> }} */ room, /** @type {unknown} */ event) => {
+  const tell = (/** @type {{ pages: Set<(event: unknown) => void>, entries: Entry[] }} */ room, /** @type {unknown} */ event) => {
+    noteEvent(room.entries, event);
     for (const send of room.pages) send(event);
   };
   /* nobody looking and nothing to do: the agent's process ends after a while, its conversation kept on disk */
@@ -134,6 +184,7 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS }) {
       tell(room, { kind: 'error', message: e instanceof Error ? e.message : String(e) });
     } finally {
       room.busy = false;
+      try { log.save(project.path, room.entries); } catch (e) { console.error(`agent: the conversation of ${project.path} was not kept: ${e instanceof Error ? e.message : e}`); }
       rest(project.path);
     }
   }
@@ -150,6 +201,7 @@ export function createAgentHub({ config, start, idleMs = IDLE_MS }) {
       if (room.idle) { clearTimeout(room.idle); room.idle = null; }
       room.pages.add(send);
       send({ kind: 'ready', available: Boolean(config), busy: room.busy, model: config?.name ?? null });
+      if (room.entries.length) send({ kind: 'history', entries: room.entries });
       return {
         said(/** @type {string} */ text) {
           const said = readSaid(text);
